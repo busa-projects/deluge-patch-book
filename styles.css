@@ -1,0 +1,802 @@
+:root {
+  /* Verified straight from delugecommunity.com's own hardware-control icons
+     (decoded from the site's inline SVGs): gold encoder fill/stroke/label,
+     the neutral "Select" encoder colors, and the cyan "turn" indicator. The
+     page chrome itself uses Starlight's default blue, but that's just the
+     doc-framework theme -- these hardware colors are the site's actual
+     Deluge-specific visual identity, so they're what this app matches. */
+  --bg: #17181a;
+  --panel: #1c1d20;
+  --panel-2: #232427;
+  --border: #34363d;
+  --text: #ecebe8;
+  --text-dim: #9a9ba2;
+  --gold: #ad7309;
+  --gold-stroke: #e2ad5d;
+  --gold-text: #ffecd2;
+  --select-fill: #1e1e1e;
+  --select-stroke: #949494;
+  --select-text: #d0d0d0;
+  --cyan: #00ffca;
+  --accent: #e2ad5d;
+  --accent-soft: #3a2d13;
+  --accent-2: #00ffca;
+  --changed: #f0d000;
+  --changed-soft: #3d3406;
+  --danger: #ff5a5a;
+  --danger-soft: #3d1414;
+  --done: #55565d;
+  font-size: 15px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", Helvetica, Arial, sans-serif;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 22px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.topbar h1 { font-size: 18px; margin: 0; letter-spacing: 0.02em; }
+
+.topbar-controls { display: flex; align-items: center; gap: 20px; }
+
+.deluge-connect { display: flex; align-items: center; gap: 8px; }
+.deluge-connect .btn-secondary { width: auto; padding: 6px 12px; font-size: 12px; }
+.deluge-status { font-size: 12px; color: var(--text-dim); }
+.deluge-status.connected { color: var(--cyan); }
+
+.mode-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+.mode-label { font-size: 13px; color: var(--text-dim); }
+.mode-toggle input { display: none; }
+.mode-toggle .slider {
+  width: 38px; height: 20px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  position: relative;
+  transition: background .15s;
+}
+.mode-toggle .slider::before {
+  content: "";
+  position: absolute;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  top: 2px; left: 2px;
+  transition: transform .15s, background .15s;
+}
+.mode-toggle input:checked + .slider { background: var(--accent-soft); }
+.mode-toggle input:checked + .slider::before {
+  transform: translateX(18px);
+  background: var(--accent);
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  height: calc(100% - 53px);
+}
+
+.library {
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.loader { padding: 18px; }
+.loader p { color: var(--text-dim); font-size: 13px; line-height: 1.5; }
+.or-divider { text-align: center; margin: 10px 0; color: var(--text-dim); font-size: 12px; }
+
+.btn-primary, .btn-secondary {
+  width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn-primary { background: var(--accent); color: #0d1410; font-weight: 600; border-color: var(--accent); }
+.btn-secondary { background: var(--panel-2); color: var(--text); }
+.btn-link {
+  background: none; border: none; color: var(--accent-2);
+  font-size: 12px; cursor: pointer; padding: 0;
+}
+
+.load-status { font-size: 12px; color: var(--accent); min-height: 16px; }
+
+.library-body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex: 1;
+  padding: 12px;
+  gap: 8px;
+}
+
+#searchBox {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+}
+
+/* Library filter chips: a compact row per group (engine / oscillator
+   source / other flags), sized and colored like the existing mini-toggle
+   pills used above the step list, but as click-to-select/toggle buttons
+   instead of checkboxes -- reads better at this width than a row of
+   labeled sliders would for 3-4 mutually-exclusive-or-not options each. */
+.library-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.filter-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.filter-chip {
+  background: var(--panel-2);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 3px 9px;
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.filter-chip:hover { color: var(--text); border-color: var(--text-dim); }
+.filter-chip.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+.preset-count { font-size: 11px; color: var(--text-dim); }
+
+.preset-tree { overflow-y: auto; flex: 1; }
+
+.pack-group { margin-bottom: 4px; }
+.pack-header {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  padding: 6px 4px 4px;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+}
+.pack-header:hover { color: var(--text); }
+
+.preset-item {
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.preset-item:hover { background: var(--panel-2); }
+.preset-item.active { background: var(--accent); color: #0d1410; font-weight: 600; }
+.preset-item .done-badge {
+  float: right; font-size: 11px; color: var(--accent);
+}
+.preset-item.active .done-badge { color: #0d1410; }
+
+.guide {
+  overflow-y: auto;
+  padding: 26px 40px 60px;
+}
+
+.guide-empty {
+  color: var(--text-dim);
+  font-size: 14px;
+  margin-top: 60px;
+  text-align: center;
+}
+
+.guide-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 14px;
+  margin-bottom: 20px;
+}
+.guide-pack { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+#guideTitle { margin: 2px 0 0; font-size: 24px; }
+.guide-progress { text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+#progressText { display: block; font-size: 12px; color: var(--text-dim); }
+.guide-progress .btn-link { margin-left: 12px; }
+
+.menu-hint {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-2);
+  border-radius: 6px;
+  padding: 12px 16px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  margin-bottom: 22px;
+  line-height: 1.6;
+}
+.menu-hint b { color: var(--text); }
+.menu-hint i { color: var(--text-dim); }
+
+/* Guide-level action buttons: Glossary / Print, above the tab bar. */
+.guide-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 14px 0 4px;
+}
+.guide-actions .btn-secondary { width: auto; padding: 7px 14px; font-size: 12.5px; }
+
+/* Idea 7: Compare tab */
+.compare-picker { margin-bottom: 14px; font-size: 13px; color: var(--text-dim); }
+.compare-picker select {
+  margin-left: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+/* Session 4/5: two full Signal Path diagrams, stacked one above the other
+   (see the comment above renderCompareTab() in app.js) -- the whole
+   comparison now, no separate flag-table summary alongside them. */
+.compare-diagrams { display: flex; flex-direction: column; gap: 28px; }
+.compare-col-title { margin: 0 0 8px; font-size: 13px; color: var(--text-dim); text-align: center; font-weight: 600; }
+
+/* Idea 8: glossary modal */
+.glossary-list { display: flex; flex-direction: column; gap: 14px; max-height: 55vh; overflow-y: auto; }
+.glossary-term { font-weight: 700; color: var(--accent-2); font-size: 13.5px; margin-bottom: 3px; }
+.glossary-body { font-size: 13px; color: var(--text-dim); line-height: 1.55; }
+
+/* Idea 2: WebAudio demo modal */
+.audio-demo-note { font-size: 11.5px; color: var(--text-dim); margin: 0 0 12px; line-height: 1.5; }
+.demo-controls { display: flex; flex-direction: column; gap: 10px; }
+.demo-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-dim); }
+.demo-row input[type="range"] { flex: 1; accent-color: var(--accent); }
+.demo-row select {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 3px 6px; font-size: 12.5px;
+}
+.demo-val { min-width: 54px; text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }
+.step-ref.step-demo { margin-top: 8px; }
+.demo-open-btn { font-size: 12px; }
+
+/* Session 3: ADSR demo's live envelope-shape curve, drawn as inline SVG for
+   visual consistency with buildSignalPathSvg()'s diagrams elsewhere in this
+   app (see .signal-diagram-wrap / .sd-* above) rather than a second visual
+   language (e.g. canvas). */
+.demo-envelope-svg-wrap { margin-top: 2px; }
+.demo-envelope-svg { display: block; width: 100%; max-width: 280px; margin: 0 auto; }
+.env-baseline { stroke: var(--border); stroke-width: 1; }
+.env-curve-path { fill: none; stroke: var(--accent-2); stroke-width: 2; }
+.env-playhead { fill: var(--accent); }
+
+/* Per-guide toolbar: Show manual reference / Show tips -- small pill
+   toggles, visually distinct from (and lighter-weight than) the page-level
+   Beginner/Expert switch. */
+.guide-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-bottom: 16px;
+}
+.mini-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.mini-toggle input { display: none; }
+.mini-toggle .mini-slider {
+  width: 30px; height: 16px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  position: relative;
+  transition: background .15s;
+  flex-shrink: 0;
+}
+.mini-toggle .mini-slider::before {
+  content: "";
+  position: absolute;
+  width: 11px; height: 11px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  top: 1.5px; left: 1.5px;
+  transition: transform .15s, background .15s;
+}
+.mini-toggle input:checked + .mini-slider { background: var(--accent-soft); }
+.mini-toggle input:checked + .mini-slider::before {
+  transform: translateX(14px);
+  background: var(--accent);
+}
+.mini-toggle input:checked ~ span:last-child { color: var(--text); }
+
+/* "Show sources" / "Show tips" captions under a step's instruction text. */
+.step-ref {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin-top: 6px;
+  padding-left: 2px;
+}
+.step-ref b { color: var(--text-dim); font-weight: 600; }
+.step-ref a { color: var(--accent-2); text-decoration: none; }
+.step-ref a:hover { text-decoration: underline; }
+.step-ref.step-tip { color: var(--text-dim); border-left: 2px solid var(--border); padding-left: 8px; }
+.step-ref.step-source-community { color: var(--changed); }
+.step-ref.step-source-community a { color: var(--changed); }
+
+.section-block { margin-bottom: 26px; }
+.section-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent-2);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 10px;
+}
+
+.step {
+  display: flex;
+  gap: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+}
+.step.done { opacity: 0.55; }
+.step input[type="checkbox"] {
+  margin-top: 3px;
+  width: 16px; height: 16px;
+  flex-shrink: 0;
+  accent-color: var(--accent);
+}
+.step-body { flex: 1; }
+.step-title { font-weight: 600; font-size: 14px; margin-bottom: 3px; }
+.step-text { font-size: 13.5px; color: var(--text-dim); line-height: 1.5; }
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  padding: 1px 7px;
+  border-radius: 1em;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.kbd:has(svg) { padding-left: 3px; }
+.kbd svg { display: block; flex-shrink: 0; }
+.step-text .value {
+  color: var(--text);
+  font-weight: 600;
+}
+.step-text ul { margin: 6px 0 0; padding-left: 18px; }
+.step-text table { border-collapse: collapse; margin-top: 6px; font-size: 12.5px; }
+.step-text td, .step-text th { padding: 2px 8px 2px 0; text-align: left; color: var(--text-dim); }
+.step-text th { color: var(--text); }
+
+/* Tab bar: Steps / Mod Matrix / Signal Path */
+.tab-bar {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin: 18px 0 20px;
+}
+.tab-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 14px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--cyan); border-bottom-color: var(--cyan); }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* Shared reference-table style, used by the mod matrix tab */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.data-table th {
+  text-align: left;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  padding: 8px 12px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+}
+.data-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+.data-table tr:last-child td { border-bottom: none; }
+.data-table tr.is-default td { color: var(--text-dim); }
+.data-table .amount-bar {
+  display: inline-block;
+  width: 70px;
+  height: 6px;
+  background: var(--panel-2);
+  border-radius: 3px;
+  position: relative;
+  vertical-align: middle;
+  margin-right: 8px;
+}
+.data-table .amount-bar > span {
+  position: absolute;
+  top: 0; bottom: 0;
+  background: var(--accent);
+  border-radius: 3px;
+}
+.empty-note { color: var(--text-dim); font-size: 13px; padding: 20px 0; }
+
+/* Mod matrix cross-tab: sources across the top, destinations down the side */
+.matrix-grid { table-layout: fixed; }
+.matrix-grid .mm-corner {
+  min-width: 160px;
+  font-size: 10px;
+  background: var(--panel-2);
+}
+.matrix-grid th:not(.mm-corner) { text-align: center; min-width: 84px; }
+.matrix-grid .mm-rowhead {
+  text-align: left;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.matrix-grid .mm-cell {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  font-size: 12.5px;
+}
+.matrix-grid .mm-cell.is-default { color: var(--text-dim); font-weight: 400; background: transparent; }
+/* Yellow border = this routing differs from the init patch's own cables. */
+.matrix-grid .mm-cell:not(.is-default) { color: var(--changed); background: var(--changed-soft); box-shadow: inset 0 0 0 1.5px var(--changed); }
+.matrix-grid .mm-empty { text-align: center; color: var(--border); }
+.matrix-grid .amount-bar { display: block; width: 90%; margin: 4px auto 0; height: 4px; }
+
+/* Signal path diagram */
+.signal-diagram-wrap {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px;
+  overflow-x: auto;
+}
+.signal-diagram-wrap svg { display: block; margin: 0 auto; }
+.sd-box { fill: var(--panel-2); stroke: var(--border); stroke-width: 1.5; }
+/* Yellow border = this box's value differs from the init patch. */
+.sd-box.changed { stroke: var(--changed); stroke-width: 2; }
+.sd-box.bypassed { opacity: 0.4; }
+/* Modulation-source lane boxes: cyan, matching the dashed cyan mod lines. */
+.sd-box.lane { stroke: var(--src-color, var(--cyan)); fill: var(--panel); }
+/* Session 4/5, Compare tab: this box differs BETWEEN the two Compare
+   diagrams. Same yellow the Signal Path tab already uses for "differs
+   from this preset's own init patch" (.changed above) -- one color for
+   "this box isn't at its default" everywhere in the app, rather than a
+   second color the user has to separately learn. Set by
+   flagCompareDifferences(), never by buildSignalPathSvg() itself. */
+.sd-box.compare-differs { stroke: var(--changed); stroke-width: 2; }
+.sd-hoverable { cursor: default; }
+.sd-label { fill: var(--text); font-size: 12px; font-family: "Segoe UI", Helvetica, Arial, sans-serif; }
+.sd-sublabel { fill: var(--text-dim); font-size: 10px; font-family: "Segoe UI", Helvetica, Arial, sans-serif; }
+.sd-arrow { stroke: var(--text-dim); stroke-width: 1.5; fill: none; marker-end: url(#sd-arrowhead); }
+/* Modulation lines are drawn as curves whose tangent at the endpoint doesn't
+   reliably point at the target, so an auto-oriented arrowhead marker on them
+   often ends up pointing the wrong way. No marker at all reads better than
+   one that's frequently backwards -- the dashed cyan styling and matching
+   source/target color already make the connection clear without it. */
+.sd-arrow.mod { stroke: var(--cyan); stroke-dasharray: 3 3; marker-end: none; }
+.sd-mod-label { fill: var(--cyan); font-size: 9.5px; font-family: "SFMono-Regular", Consolas, Menlo, monospace; }
+
+/* Custom hover tooltip for signal-path nodes (native SVG <title> is
+   unreliable for markup injected via innerHTML, especially in Safari). */
+.svg-tooltip {
+  position: fixed;
+  z-index: 1000;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 6px 10px;
+  border-radius: 6px;
+  white-space: pre-line;
+  pointer-events: none;
+  max-width: 260px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+/* Generic modal overlay: reused for the Deluge file picker and the check
+   settings panel. */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+/* An author rule of equal specificity to the UA stylesheet's [hidden] rule
+   wins the cascade (author beats user-agent origin regardless of order),
+   so `display: flex` above was overriding `hidden` and leaving this
+   full-screen overlay showing -- and eating every click -- from first
+   paint. Needs its own, higher-specificity override. */
+.modal-overlay[hidden] { display: none; }
+.modal-box {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+  width: min(480px, 90vw);
+  max-height: 80vh;
+  overflow-y: auto;
+}
+.modal-box h3 { margin: 0 0 14px; font-size: 15px; }
+.modal-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 14px; max-height: 50vh; overflow-y: auto; }
+.modal-list-item {
+  text-align: left;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  cursor: pointer;
+  word-break: break-all;
+}
+.modal-list-item:hover { border-color: var(--accent-2); }
+/* Plain (non-folder, non-search-result) file rows get a name + optional
+   category hint span once the device-side "Categorize this folder…"
+   feature has read one -- lay those two out like the folder row already
+   does, without touching that row's own .modal-list-folder rule. */
+.modal-list-item:not(.modal-list-folder) { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.modal-item-category { font-size: 10.5px; color: var(--accent); flex-shrink: 0; white-space: nowrap; }
+
+/* Device-side (experimental) category filter chips + "Categorize this
+   folder…" opt-in button, inside the "Load from connected Deluge" file
+   picker modal only -- reuses .library-filters/.filter-chip/.filter-group
+   from the local library filter panel for visual consistency. */
+.modal-device-filters { margin-bottom: 8px; }
+.modal-device-filters-note {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  margin: 5px 0 0;
+  line-height: 1.4;
+}
+.modal-categorize-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.modal-categorize-btn { width: auto; padding: 6px 12px; font-size: 12px; }
+.modal-categorize-status { font-size: 11.5px; color: var(--text-dim); }
+
+.modal-search {
+  width: 100%;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+  box-sizing: border-box;
+}
+
+.modal-breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+.modal-breadcrumb-item {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 2px 3px;
+  font-size: 12px;
+}
+.modal-breadcrumb-item:last-of-type { color: var(--text); font-weight: 600; }
+.modal-breadcrumb-item:hover { color: var(--accent-2); }
+.modal-breadcrumb-sep { color: var(--text-dim); }
+
+.modal-list-folder {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.modal-folder-icon { flex-shrink: 0; }
+.modal-item-name { flex: 1; text-align: left; word-break: break-all; }
+.modal-item-count { font-size: 11px; color: var(--text-dim); flex-shrink: 0; }
+
+.modal-list-search-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+}
+.modal-list-search-item .modal-item-path {
+  font-size: 11px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
+.modal-empty { font-size: 12.5px; color: var(--text-dim); padding: 8px 2px; }
+
+/* Live-device check: guide + entry point, above the step list */
+.device-check-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--cyan);
+  border-radius: 8px;
+  padding: 14px 18px;
+  margin-bottom: 22px;
+  flex-wrap: wrap;
+}
+.device-check-title { font-weight: 700; font-size: 13px; margin-bottom: 5px; }
+.device-check-desc {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.55;
+  max-width: 560px;
+  margin: 0;
+}
+.device-check-desc + .device-check-desc { margin-top: 8px; }
+.device-check-desc code {
+  font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+  font-size: 11.5px;
+  background: var(--panel-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.device-check-desc strong { color: var(--text); }
+.device-check-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.btn-check { width: auto; padding: 10px 18px; white-space: nowrap; }
+
+.device-check-status { font-size: 11.5px; color: var(--text-dim); text-align: right; max-width: 220px; }
+
+/* Live-device check status, applied directly to a step in the checklist
+   below (see stepCheckStatus() in app.js) -- no separate results list. */
+.step.check-ok { border-color: var(--cyan); }
+.step.check-changed { border-color: var(--changed); }
+.step.check-unexpected { border-color: var(--danger); }
+
+/* Colors an individual instruction fragment in place (e.g. the literal
+   text "SHIFT+ATTACK 31") once a device check has data for it -- see ck()
+   and the [data-check-path] pass in renderGuide() in app.js. On a
+   multi-value step like an envelope's A/D/S/R, each fragment gets its own
+   color instead of one status for the whole step. "untouched" (still at
+   the init value) intentionally gets no styling -- it should read as
+   ordinary text, not be highlighted. */
+/* The kbd()/val() spans nested inside a fragment (".kbd", ".value") carry
+   their own explicit color, which would otherwise win over the wrapper's
+   color by specificity -- so the status color is repeated onto them
+   directly rather than relying on inheritance. */
+.check-value.check-ok,
+.check-value.check-ok .value,
+.check-value.check-ok .kbd { color: var(--cyan); }
+.check-value.check-changed,
+.check-value.check-changed .value,
+.check-value.check-changed .kbd { color: var(--changed); }
+.check-value.check-unexpected,
+.check-value.check-unexpected .value,
+.check-value.check-unexpected .kbd { color: var(--danger); }
+
+/* Flags device-side changes with no step of their own to be colored in --
+   a parameter the target patch never uses (e.g. bitcrush on a patch that
+   never touched it) or an extra patch cable the target didn't ask for.
+   See findUnexpectedChanges() in app.js. */
+.unexpected-changes {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--danger);
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin-bottom: 22px;
+  font-size: 12.5px;
+}
+.unexpected-title { font-weight: 700; color: var(--danger); margin-bottom: 6px; }
+.unexpected-changes ul { margin: 0; padding-left: 18px; color: var(--text-dim); }
+/* Idea 6: "did you mean to...?" teaching note under a flagged unexpected
+   change, shown when "Show tips" is on -- reuses the same PARAM_CONCEPTS
+   copy the Steps tab shows, so learning why a parameter matters isn't
+   limited to only the steps this specific preset happens to use. */
+.unexpected-note { color: var(--text-dim); font-size: 11.5px; margin-top: 2px; line-height: 1.5; }
+
+/* Minimal styling for deluge-check-settings.js's own generated markup. */
+.deluge-check-settings { display: flex; flex-direction: column; gap: 10px; font-size: 13px; }
+.deluge-check-settings__row { display: flex; align-items: center; }
+.deluge-check-settings input[type="number"] {
+  width: 70px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 3px 6px;
+  margin-left: 4px;
+}
+.deluge-check-settings__overrides { display: flex; flex-direction: column; gap: 6px; padding-top: 6px; border-top: 1px solid var(--border); }
+
+@media (max-width: 800px) {
+  .layout { grid-template-columns: 1fr; }
+  .library { border-right: none; border-bottom: 1px solid var(--border); max-height: 40vh; }
+  .device-check-panel { flex-direction: column; align-items: stretch; }
+  .device-check-actions { align-items: stretch; }
+  .btn-check { width: 100%; }
+}

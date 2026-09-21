@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Deluge Patch Book</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <h1>Deluge Patch Book</h1>
+  <div class="topbar-controls">
+    <div class="deluge-connect">
+      <button id="delugeConnectBtn" class="btn-secondary">Connect Deluge&hellip;</button>
+      <span id="delugeStatus" class="deluge-status">not connected</span>
+    </div>
+    <label class="mode-toggle">
+      <span class="mode-label">Beginner</span>
+      <input type="checkbox" id="modeToggle" />
+      <span class="slider"></span>
+      <span class="mode-label">Expert</span>
+    </label>
+  </div>
+</header>
+
+<main class="layout">
+  <aside class="library">
+    <div class="loader" id="loaderPanel">
+      <p>Load your <code>synths</code> preset folder to build the library. Nothing is uploaded &mdash;
+         files are read locally in your browser.</p>
+      <button id="pickFolderBtn" class="btn-primary">Choose synths folder&hellip;</button>
+      <input type="file" id="folderInput" webkitdirectory multiple style="display:none" />
+      <p class="or-divider">or</p>
+      <button id="pickFilesBtn" class="btn-secondary">Choose individual XML files&hellip;</button>
+      <input type="file" id="filesInput" multiple accept=".xml,.XML" style="display:none" />
+      <p class="or-divider">or</p>
+      <button id="loadFromDelugeBtn" class="btn-secondary">Load a preset from connected Deluge&hellip;</button>
+      <p id="loadStatus" class="load-status"></p>
+    </div>
+
+    <div class="library-body" id="libraryBody" hidden>
+      <input type="search" id="searchBox" placeholder="Search presets or packs&hellip;" />
+      <div class="library-filters" id="libraryFilters">
+        <div class="filter-group" role="group" aria-label="Filter by engine">
+          <button type="button" class="filter-chip" data-group="engine" data-value="all">All engines</button>
+          <button type="button" class="filter-chip" data-group="engine" data-value="subtractive">Subtractive</button>
+          <button type="button" class="filter-chip" data-group="engine" data-value="fm">FM</button>
+          <button type="button" class="filter-chip" data-group="engine" data-value="ringmod">Ring Mod</button>
+        </div>
+        <div class="filter-group" role="group" aria-label="Filter by oscillator source">
+          <button type="button" class="filter-chip" data-group="oscSource" data-value="all">Any osc</button>
+          <button type="button" class="filter-chip" data-group="oscSource" data-value="waveform">Waveform</button>
+          <button type="button" class="filter-chip" data-group="oscSource" data-value="sample">Sample</button>
+          <button type="button" class="filter-chip" data-group="oscSource" data-value="multisample">Multisample</button>
+        </div>
+        <div class="filter-group" role="group" aria-label="Filter by other features">
+          <button type="button" class="filter-chip" data-group="flags" data-value="hasArp">Arp</button>
+          <button type="button" class="filter-chip" data-group="flags" data-value="hasUnison">Unison</button>
+          <button type="button" class="filter-chip" data-group="flags" data-value="hasCables">Custom cables</button>
+          <button type="button" class="filter-chip" data-group="flags" data-value="hasSidechain">Sidechain</button>
+        </div>
+      </div>
+      <div class="preset-count" id="presetCount"></div>
+      <div id="presetTree" class="preset-tree"></div>
+    </div>
+  </aside>
+
+  <section class="guide" id="guidePanel">
+    <div class="guide-empty" id="guideEmpty">
+      <p>Load a folder on the left, then pick a preset to see its step-by-step build guide.</p>
+    </div>
+    <div class="guide-content" id="guideContent" hidden>
+      <div class="guide-header">
+        <div>
+          <div class="guide-pack" id="guidePack"></div>
+          <h2 id="guideTitle"></h2>
+        </div>
+        <div class="guide-progress">
+          <span id="progressText"></span>
+          <button id="resetProgressBtn" class="btn-link">Reset progress</button>
+        </div>
+      </div>
+      <div class="guide-actions">
+        <button id="glossaryBtn" class="btn-secondary">Glossary</button>
+        <button id="printBtn" class="btn-secondary">Print / export cheat sheet</button>
+      </div>
+      <div class="tab-bar" id="tabBar">
+        <button class="tab-btn active" data-tab="steps">Steps</button>
+        <button class="tab-btn" data-tab="matrix">Mod Matrix</button>
+        <button class="tab-btn" data-tab="signal">Signal Path</button>
+        <button class="tab-btn" data-tab="compare">Compare</button>
+      </div>
+      <div class="tab-panel active" id="tabSteps">
+        <div class="guide-toolbar" id="guideToolbar">
+          <label class="mini-toggle" title="Show which manual section or community-firmware doc backs each step">
+            <input type="checkbox" id="refsToggle" />
+            <span class="mini-slider"></span>
+            <span>Show manual reference</span>
+          </label>
+          <label class="mini-toggle" title="Show a short 'why this matters' (and sometimes 'try this') line under select steps">
+            <input type="checkbox" id="tipsToggle" />
+            <span class="mini-slider"></span>
+            <span>Show tips</span>
+          </label>
+        </div>
+        <div class="device-check-panel" id="deviceCheckPanel">
+          <div class="device-check-info">
+            <div class="device-check-title">Check your progress on the Deluge</div>
+            <p class="device-check-desc">
+              Save your in-progress patch to the SD card on the Deluge (any name, anywhere
+              under <code>/SYNTHS</code>). Then click <strong>Check on device</strong> &mdash;
+              you'll pick that file once, and every click after just re-reads it.
+            </p>
+            <p class="device-check-desc">
+              The steps below update automatically: a step ticks itself off once it's a
+              perfect match, turns yellow if you've changed it but it's not there yet, and
+              red if you changed something this preset doesn't actually use.
+              <strong>Check settings</strong> lets you loosen or tighten how exact a match
+              needs to be.
+            </p>
+          </div>
+          <div class="device-check-actions">
+            <button id="checkOnDeviceBtn" class="btn-primary btn-check">Check on device&hellip;</button>
+            <button id="checkSettingsBtn" class="btn-link">Check settings&hellip;</button>
+            <span id="deviceCheckStatus" class="device-check-status"></span>
+          </div>
+        </div>
+        <div class="unexpected-changes" id="unexpectedChanges" hidden></div>
+        <div id="guideSections"></div>
+      </div>
+      <div class="tab-panel" id="tabMatrix">
+        <div id="modMatrixContent"></div>
+      </div>
+      <div class="tab-panel" id="tabSignal">
+        <div id="signalPathContent"></div>
+      </div>
+      <div class="tab-panel" id="tabCompare">
+        <div id="compareContent"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="svgTooltip" class="svg-tooltip" hidden></div>
+<div id="modalOverlay" class="modal-overlay" hidden></div>
+
+<script src="modules/deluge-sysex.js"></script>
+<script src="modules/deluge-check.js"></script>
+<script src="modules/deluge-check-settings.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

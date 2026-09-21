@@ -1,0 +1,13 @@
+# DelugePatchBook is the shipped application: index.html, app.js, styles.css,
+# modules/, README.md, LICENSE. Everything below is development/test tooling
+# that lives alongside it but isn't part of the app itself -- see tests/
+# own package.json (it's a separate, dependency-having project on purpose).
+
+# The entire dev/QA project: Playwright config, spec files, node_modules,
+# generated reports, screenshots. Keeps the synced/shared app free of
+# multi-hundred-MB node_modules and disposable test artifacts.
+tests/
+
+# OS/editor junk that shows up everywhere, not just in tests/.
+.DS_Store
+Thumbs.db
