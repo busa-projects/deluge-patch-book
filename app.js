@@ -1283,6 +1283,109 @@ function buildCheckSteps(patch) {
 // ---------------------------------------------------------------------------
 // Mod Matrix tab: every patch cable in this preset, as a reference table.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Pinch-to-zoom + pan wrapper, shared by the Mod Matrix table and the Signal
+// Path / Compare SVG diagrams -- all three can be wider (or, once zoomed,
+// taller) than a phone screen and hard to read at native size even with the
+// plain horizontal scroll they already had. Panning after a pinch is native
+// browser scrolling, not custom drag logic: the only custom part is the
+// pinch gesture itself (mapped to a CSS scale on `.zoom-content`) and a
+// double-tap/button reset. `.zoom-content` is sized to its natural
+// (unscaled) content and absolutely positioned inside `.zoom-spacer`, whose
+// width/height are set in JS to naturalSize*scale -- that's what makes
+// `.zoom-viewport`'s native overflow:auto scrollbars/panning cover the
+// actual zoomed footprint instead of the transform (which alone never
+// affects layout size).
+// ---------------------------------------------------------------------------
+function makeZoomable(innerHtml, extraClass) {
+  return `<div class="zoom-wrap">
+    <div class="zoom-toolbar"><button type="button" class="zoom-reset-btn" hidden>&#8634; Reset zoom</button></div>
+    <div class="zoom-viewport${extraClass ? ' ' + extraClass : ''}">
+      <div class="zoom-spacer"><div class="zoom-content">${innerHtml}</div></div>
+    </div>
+  </div>`;
+}
+
+function initZoomViewport(viewportEl) {
+  if (!viewportEl || viewportEl.dataset.zoomInit) return;
+  viewportEl.dataset.zoomInit = '1';
+  const spacer = viewportEl.querySelector(':scope > .zoom-spacer');
+  const content = spacer && spacer.querySelector(':scope > .zoom-content');
+  const resetBtn = viewportEl.parentElement.querySelector(':scope > .zoom-toolbar > .zoom-reset-btn');
+  if (!content || !resetBtn) return;
+
+  let scale = 1, naturalW = 0, naturalH = 0, pinch = null, lastTapTime = 0;
+
+  function apply() {
+    content.style.transformOrigin = '0 0';
+    content.style.transform = `scale(${scale})`;
+    spacer.style.width = (naturalW * scale) + 'px';
+    spacer.style.height = (naturalH * scale) + 'px';
+    viewportEl.classList.toggle('is-zoomed', scale > 1);
+    resetBtn.hidden = scale === 1;
+  }
+
+  function measure() {
+    content.style.transform = 'none';
+    const r = content.getBoundingClientRect();
+    naturalW = r.width;
+    naturalH = r.height;
+    apply();
+  }
+
+  function setScale(newScale, focalClientX, focalClientY) {
+    newScale = Math.min(4, Math.max(1, newScale));
+    const vr = viewportEl.getBoundingClientRect();
+    const beforeX = viewportEl.scrollLeft + (focalClientX - vr.left);
+    const beforeY = viewportEl.scrollTop + (focalClientY - vr.top);
+    const ratio = scale ? newScale / scale : 1;
+    scale = newScale;
+    apply();
+    viewportEl.scrollLeft = beforeX * ratio - (focalClientX - vr.left);
+    viewportEl.scrollTop = beforeY * ratio - (focalClientY - vr.top);
+  }
+
+  const dist = (t0, t1) => Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+  const mid = (t0, t1) => ({ x: (t0.clientX + t1.clientX) / 2, y: (t0.clientY + t1.clientY) / 2 });
+
+  viewportEl.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      pinch = { startDist: dist(e.touches[0], e.touches[1]), startScale: scale };
+    } else if (e.touches.length === 1) {
+      const now = Date.now();
+      if (now - lastTapTime < 300) setScale(1, e.touches[0].clientX, e.touches[0].clientY);
+      lastTapTime = now;
+    }
+  }, { passive: false });
+
+  viewportEl.addEventListener('touchmove', (e) => {
+    if (pinch && e.touches.length === 2) {
+      e.preventDefault();
+      const d = dist(e.touches[0], e.touches[1]);
+      const m = mid(e.touches[0], e.touches[1]);
+      setScale(pinch.startScale * (d / pinch.startDist), m.x, m.y);
+    }
+  }, { passive: false });
+
+  viewportEl.addEventListener('touchend', (e) => { if (e.touches.length < 2) pinch = null; });
+  viewportEl.addEventListener('touchcancel', () => { pinch = null; });
+
+  resetBtn.addEventListener('click', () => {
+    const vr = viewportEl.getBoundingClientRect();
+    setScale(1, vr.left + vr.width / 2, vr.top + vr.height / 2);
+  });
+
+  // Mod Matrix / Signal Path start out inside a `display:none` inactive tab
+  // panel, where getBoundingClientRect() reads 0x0 -- a plain call right
+  // after render can't measure real content size yet. ResizeObserver fires
+  // again once the tab is switched to and the content actually lays out, so
+  // natural size gets picked up correctly whenever that happens instead of
+  // needing tab-switch code to know about zoom internals.
+  new ResizeObserver(() => { if (scale === 1) measure(); }).observe(content);
+  measure();
+}
+
 function buildModMatrixTable(patch) {
   const cables = cablesOf(patch);
   if (!cables.length) {
@@ -1315,15 +1418,14 @@ function buildModMatrixTable(patch) {
     }).join('');
     return `<tr><th class="mm-rowhead">${SOURCE_LABEL[s] || humanize(s)}</th>${cells}</tr>`;
   }).join('');
+  const table = `<table class="data-table matrix-grid">
+      <thead><tr><th class="mm-corner">Source &darr; / Destination &rarr;</th>${destHeaderCells}</tr></thead>
+      <tbody>${bodyRows}</tbody>
+    </table>`;
   return `
     <p class="empty-note" style="padding:0 0 12px">Depth shown is the Deluge's own -50.00 to 50.00 scale. Muted cells are
       unchanged from the init patch's built-in routings; highlighted cells are this preset's own choices.</p>
-    <div style="overflow-x:auto">
-    <table class="data-table matrix-grid">
-      <thead><tr><th class="mm-corner">Source &darr; / Destination &rarr;</th>${destHeaderCells}</tr></thead>
-      <tbody>${bodyRows}</tbody>
-    </table>
-    </div>`;
+    ${makeZoomable(table)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,7 +1793,8 @@ function buildSignalPathSvg(patch, idPrefix) {
 
   const totalWidth = Math.max(x, out.right + 20, laneRight + 20);
   const totalHeight = maxY + 24;
-  return `<div class="signal-diagram-wrap"><svg id="${svgId}" viewBox="0 0 ${totalWidth} ${totalHeight}" width="${totalWidth}" height="${totalHeight}" xmlns="http://www.w3.org/2000/svg">${defs}${arrows.join('')}${boxes.join('')}</svg></div>`;
+  const svg = `<svg id="${svgId}" viewBox="0 0 ${totalWidth} ${totalHeight}" width="${totalWidth}" height="${totalHeight}" xmlns="http://www.w3.org/2000/svg">${defs}${arrows.join('')}${boxes.join('')}</svg>`;
+  return makeZoomable(svg, 'signal-diagram-wrap');
 }
 
 // ---------------------------------------------------------------------------
@@ -1789,6 +1892,7 @@ function renderCompareTab() {
       </div>`;
     const cols = diagramsWrap.querySelectorAll('.compare-col');
     flagCompareDifferences(cols[0], cols[1]);
+    diagramsWrap.querySelectorAll('.zoom-viewport').forEach(initZoomViewport);
   }
   select.addEventListener('change', () => renderFor(select.value));
   renderFor(selectedId);
@@ -1824,6 +1928,109 @@ function openGlossary() {
     list.className = 'glossary-list';
     list.innerHTML = GLOSSARY.map(g =>
       `<div class="glossary-entry"><div class="glossary-term">${escapeHtml(g.term)}</div><div class="glossary-body">${escapeHtml(g.body)}</div></div>`
+    ).join('');
+    box.appendChild(list);
+    const close = document.createElement('button');
+    close.className = 'btn-secondary';
+    close.textContent = 'Close';
+    close.style.marginTop = '14px';
+    close.addEventListener('click', closeModal);
+    box.appendChild(close);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// User Guide: one consolidated reference for everything the app used to
+// explain piecemeal (a "Reading the steps" box above every guide, several
+// paragraphs above "Check now", a description above the loader buttons) --
+// those all got read once and then just took up permanent space for anyone
+// who came back. Static HTML (not escaped/generated from a plain-text
+// array like GLOSSARY above) since it needs real formatting -- kbd()/
+// shift() badges, bold, lists -- not just a term + one-line body.
+// ---------------------------------------------------------------------------
+function userGuideSections() {
+  return [
+    { title: 'Loading presets', body: `
+      <p>Click <b>Choose synths folder&hellip;</b> and select your <code>SYNTHS</code> folder
+      &mdash; copy it off the Deluge's SD card onto your computer first (card reader, or via
+      USB), or connect the Deluge directly (see below). Nothing is uploaded anywhere; every file
+      is read locally in your browser.</p>
+      <p>Once loaded, use the search box and filter chips above the preset list to narrow it
+      down by engine, oscillator source, or features like Arp/Unison/Sidechain.</p>` },
+    { title: 'Beginner vs Expert', body: `
+      <p>The toggle top-right switches every step between real Deluge-hardware instructions
+      (${shift('PARAM')} shortcuts, on-device values) and terser synthesis-language
+      descriptions.</p>` },
+    { title: 'Reading the steps', body: `
+      <p>${shift('PARAM')} means hold ${kbd('SHIFT')} and press the named pad on the grid
+      (printed per function column, e.g. all OSC1 params share a column), then turn
+      ${kbd('SELECT')} to change the value. Every shortcut is also reachable the slower way via
+      the nested SOUND menu: press ${kbd('SELECT')} to open it, turn to navigate, press to drill
+      in.</p>` },
+    { title: 'The four tabs', body: `
+      <p><b>Steps</b> &mdash; the build guide itself, tick items off as you go.
+      <b>Mod Matrix</b> &mdash; every modulation routing as a table.
+      <b>Signal Path</b> &mdash; a diagram of the preset's actual signal flow, hover any box or
+      source for real values.
+      <b>Compare</b> &mdash; the same diagram for two loaded presets, stacked, with differences
+      flagged.</p>
+      <p><b>Show manual reference</b> and <b>Show tips</b> (above the step list) add a citation
+      or a short "why this matters" line under select steps.</p>` },
+    { title: 'Checking your progress on the Deluge', body: `
+      <p>The idea: while you're actually building the patch on the Deluge, you don't have to
+      just trust you got a step right and move on &mdash; you can check your real progress
+      against this guide at any point, and see exactly which values still need work before you
+      continue.</p>
+      <p>To do that: save your in-progress patch to the SD card (any name, anywhere under
+      <code>/SYNTHS</code>), then click <b>Check now</b> &mdash; you'll pick that file once, and
+      every click after just re-reads it. Steps color themselves automatically: green once a
+      value is a perfect match, yellow if you've changed it but it's not there yet, red if you
+      changed something this preset doesn't actually use. <b>Check settings</b> loosens or
+      tightens how exact a match needs to be.</p>` },
+    { title: 'Live updates (MIDI Follow)', body: `
+      <p>Needs enabling <b>on the Deluge itself</b> first: <b>SETTINGS &rarr; MIDI &rarr;
+      MIDI-FOLLOW &rarr; FEEDBACK &rarr; CHANNEL</b> must be set to an actual channel, not OFF.
+      Once that's on, a handful of steps (envelopes, oscillator/noise levels, pan) get tagged
+      <span class="step-badge step-badge-live">live</span> and update the moment you turn the
+      real knob &mdash; no SD card round trip for those. An arrow next to a live value shows
+      ${'▲'} if it's too high or ${'▼'} if it's too low. Most parameters still can't be
+      tracked this way (patch cables, dropdown-style settings, Unison, Sidechain timing) and
+      always need <b>Check now</b> instead &mdash; a step never mixes the two.</p>` },
+    { title: 'Connecting a Deluge (optional)', body: `
+      <p>Chrome, Edge or Opera only (Community Firmware 1.3+). Clicking <b>Connect
+      Deluge&hellip;</b> makes the browser ask for MIDI access including
+      <b>"system exclusive" (SysEx) messages</b> &mdash; that permission prompt sounds alarming,
+      but it's the standard, required permission for any browser-based MIDI tool that reads
+      files or device settings, and it's exactly what this app needs to browse/load presets and
+      check your progress. It's a direct USB connection between your browser and the Deluge:
+      nothing is uploaded, nothing leaves your computer.</p>
+      <p>Once connected: <b>Load a preset from connected Deluge&hellip;</b> browses
+      <code>/SYNTHS</code> on the device itself, no SD card needed.</p>
+      <p><b>On an iPhone/iPad:</b> every browser app is required to use Safari's engine
+      underneath (even ones named Chrome), and that engine doesn't support Web MIDI at all --
+      you'll need a dedicated WebMIDI-enabled browser app from the App Store instead of your
+      regular one. On a Mac, a real Chrome/Edge/Opera works exactly like on Windows/Linux.</p>` },
+    { title: 'MIDI Monitor', body: `
+      <p>Shows every raw MIDI message arriving from the Deluge in real time &mdash; the tool to
+      reach for if live updates (above) don't seem to be working: it'll show whether anything is
+      arriving at all, on which port, and whether a given CC actually resolves to a tracked
+      field.</p>` },
+    { title: 'More', body: `
+      <p><b>Glossary</b> (above the tab bar) is a quick reference for core synthesis terms.
+      <b>Print / export cheat sheet</b> opens a self-contained, printable version of the current
+      guide in a new tab.</p>` },
+  ];
+}
+function openUserGuide() {
+  openModal(box => {
+    box.classList.add('user-guide-box');
+    const h = document.createElement('h3');
+    h.textContent = 'User Guide';
+    box.appendChild(h);
+    const list = document.createElement('div');
+    list.className = 'user-guide-list';
+    list.innerHTML = userGuideSections().map(s =>
+      `<div class="user-guide-entry"><div class="user-guide-title">${escapeHtml(s.title)}</div><div class="user-guide-body">${s.body}</div></div>`
     ).join('');
     box.appendChild(list);
     const close = document.createElement('button');
@@ -3215,6 +3422,14 @@ var currentPreset = null;
 // device-check flow, and print/export cheat sheet can all get at the
 // currently loaded patch's real values without re-reading/re-parsing it.
 var currentPatch = null;
+// Same preset, parsed via DelugeCheckModule.parseDelugeXml() instead of this
+// file's own parseDelugeXml() -- buildCheckSteps()'s field paths (and, by
+// extension, MIDI-Follow live status -- see liveFieldStatus() in
+// deluge-midi-follow.js) are resolved against THAT parser's output shape,
+// not this file's, same as delugeCheck.runCheck() already re-parses the raw
+// XML text itself rather than reusing currentPatch. Cached here so live CC
+// updates (which can arrive many times a second) don't reparse on every one.
+var currentCheckTargetObj = null;
 
 function relPathParts(file) {
   const rel = file.webkitRelativePath || file.name;
@@ -3252,9 +3467,12 @@ async function ingestFiles(fileList, { autoSelectSingle = false } = {}) {
   statusEl.textContent = `Loaded ${items.length} presets.`;
   renderLibrary(document.getElementById('searchBox').value);
   document.getElementById('libraryBody').hidden = false;
-  // Picking exactly one file via "Choose individual XML files…" means
-  // there's nothing to pick from a list -- open its guide right away
-  // instead of making the user click it again in the sidebar.
+  // #filesInput has no visible button anymore (see index.html's comment --
+  // picking individual files used to silently replace the whole loaded
+  // library, which broke Compare's "pick another loaded preset" list), but
+  // stays wired as a headless single-file load path for the test suite.
+  // Picking exactly one file there means there's nothing to pick from a
+  // list, so still auto-opens its guide.
   if (autoSelectSingle && items.length === 1) {
     await selectPreset(items[0]);
   }
@@ -3319,6 +3537,7 @@ async function selectPreset(item) {
   }
   currentPreset = item;
   currentPatch = patch;
+  currentCheckTargetObj = DelugeCheckModule.parseDelugeXml(text);
   // Any on-device check result belonged to whatever preset was loaded when
   // it ran -- stale once a different preset is picked.
   lastCheckResult = null;
@@ -3329,7 +3548,9 @@ async function selectPreset(item) {
   const sections = buildGuide(patch);
   renderGuide(item, sections);
   document.getElementById('modMatrixContent').innerHTML = buildModMatrixTable(patch);
+  document.getElementById('modMatrixContent').querySelectorAll('.zoom-viewport').forEach(initZoomViewport);
   document.getElementById('signalPathContent').innerHTML = buildSignalPathSvg(patch);
+  document.getElementById('signalPathContent').querySelectorAll('.zoom-viewport').forEach(initZoomViewport);
   renderLibrary(document.getElementById('searchBox').value);
 }
 
@@ -3373,6 +3594,7 @@ const UI_BOOL_KEYS = {
   filterHasUnison: 'delugePatchBook:filterHasUnison',
   filterHasCables: 'delugePatchBook:filterHasCables',
   filterHasSidechain: 'delugePatchBook:filterHasSidechain',
+  skipSaveConfirm: 'delugePatchBook:skipSaveConfirm',
 };
 function loadUiBool(key, fallback) {
   try {
@@ -3467,6 +3689,88 @@ function wireLibraryFilters() {
 // selected, since it only means anything against the preset it was read for.
 let lastCheckFieldStatus = null;
 
+// Rebuilt by renderGuide() every time it runs: [{ el, body, step, stepId }]
+// for exactly the steps it classified as "live" (see isLiveStep()) this
+// time around. Consulted (not renderGuide() itself) whenever a live CC
+// value changes, so a knob turn recolors just these few DOM nodes instead
+// of rebuilding the whole guide -- see refreshLiveSteps() below.
+let renderedLiveSteps = [];
+
+// A live step's checkbox mirrors the device in real time, both ways: ticks
+// itself the moment the live value matches, and UN-ticks itself the moment
+// it no longer does (e.g. the knob gets bumped again) -- unlike a file-based
+// "Check now" step's tick, which is a deliberate one-way milestone (see the
+// comment in the renderGuide() loop below for why that one stays one-way).
+// status === null (no live value received yet for this step) leaves
+// whatever was already checked/unchecked alone, since there's no live truth
+// yet to assert either way -- most relevantly, it doesn't fight a manual
+// tick made before any CC arrived.
+function syncLiveChecked(checked, presetId, stepId, status) {
+  if (status === null) return !!checked[stepId];
+  const shouldBeChecked = status === 'ok';
+  if (checked[stepId] !== shouldBeChecked) {
+    checked[stepId] = shouldBeChecked;
+    saveChecked(presetId, checked);
+  }
+  return shouldBeChecked;
+}
+
+// Colors one ck()-marked fragment from its live status, AND, whenever it's
+// not yet (or no longer) a match, appends a small up/down arrow showing
+// where the live value currently sits relative to target -- pointing up
+// means "too high", down means "too low" (i.e. it shows CURRENT POSITION,
+// not a "turn it this way" instruction -- see liveFieldDirection()'s own
+// comment for why). The arrow element is created once and reused on every
+// subsequent call (not recreated per refresh) so it doesn't flicker/reflow
+// on every CC message while a knob is turned.
+function applyLiveSpanVisuals(spanEl) {
+  const path = spanEl.dataset.checkPath;
+  spanEl.classList.remove('check-ok', 'check-changed', 'check-unexpected', 'check-untouched');
+  const status = DelugeMidiFollowModule.liveFieldStatus(midiFollow, path, currentCheckTargetObj, checkSettings);
+  if (status) spanEl.classList.add(`check-${status}`);
+  let arrow = spanEl.nextElementSibling;
+  if (!arrow || !arrow.classList.contains('live-arrow')) {
+    arrow = document.createElement('span');
+    arrow.className = 'live-arrow';
+    spanEl.after(arrow);
+  }
+  const dir = (status && status !== 'ok') ? DelugeMidiFollowModule.liveFieldDirection(midiFollow, path, currentCheckTargetObj) : null;
+  arrow.hidden = !dir;
+  if (dir) {
+    arrow.textContent = dir > 0 ? '▲' : '▼';
+    arrow.title = dir > 0 ? 'Live value is too high' : 'Live value is too low';
+    arrow.classList.toggle('live-arrow-up', dir > 0);
+    arrow.classList.toggle('live-arrow-down', dir < 0);
+  }
+}
+
+// Re-colors every currently-rendered live step from the tracker's latest
+// values -- called from the MIDI Follow onUpdate() subscription (wired up
+// near the `deluge`/`midiFollow` instances further down), which can fire
+// many times a second while a knob is turned. Deliberately recomputes ALL
+// live steps on every call rather than only the ones whose fields actually
+// changed: there are only ever a handful of live steps in one guide, so the
+// extra work is negligible, and it avoids needing a per-field -> step index.
+function refreshLiveSteps() {
+  for (const { el, body, step, stepId } of renderedLiveSteps) {
+    const status = liveStepStatus(step);
+    el.classList.remove('check-ok', 'check-changed', 'check-unexpected', 'check-untouched');
+    el.classList.toggle('step-live-waiting', status === null);
+    if (status) el.classList.add(`check-${status}`);
+    if (currentPreset && status !== null) {
+      const checked = loadChecked(currentPreset.id);
+      const isChecked = syncLiveChecked(checked, currentPreset.id, stepId, status);
+      el.classList.toggle('done', isChecked);
+      const cb = el.querySelector('input[type="checkbox"]');
+      if (cb) cb.checked = isChecked;
+      updateProgressText(currentPreset.id);
+    }
+    for (const spanEl of body.querySelectorAll('[data-check-path]')) {
+      applyLiveSpanVisuals(spanEl);
+    }
+  }
+}
+
 // Rolls a guide step's checkFields (see makeStep()) up into one status:
 // "unexpected" wins even if some of the step's own fields are fine, since
 // it flags an actual mistake; otherwise all-ok beats partial "changed".
@@ -3479,6 +3783,50 @@ function stepCheckStatus(step) {
   if (statuses.every(s => s.ok)) return 'ok';
   if (statuses.some(s => s.status === 'changed')) return 'changed';
   return 'untouched';
+}
+
+// A guide step is MIDI-Follow "live" only if it has check fields AND every
+// single one is in DelugeMidiFollowModule.FIELD_TO_MIDIFOLLOW_PARAM -- the
+// "never mix live and check-file values in one step" rule means one
+// uncovered field (e.g. a filter step's enum-only "LPF mode") disqualifies
+// the whole step back to ordinary check-file behavior, even though most of
+// its other fields are perfectly live-mappable.
+function isLiveStep(step) {
+  return !!(step.checkFields && step.checkFields.length &&
+    step.checkFields.every(f => DelugeMidiFollowModule.isLiveMappable(f.path)));
+}
+
+// Live counterpart of stepCheckStatus() above: same rollup priority
+// (unexpected wins, then all-ok, then in-progress), reading live CC-derived
+// values instead of the last file-based check. Returns null if not a
+// single one of this step's fields has received a live CC value yet
+// (device connected, but nothing's been turned since) -- callers show a
+// "waiting" state, not a color, for that case (see step-live-waiting in
+// renderGuide()).
+//
+// Unlike stepCheckStatus(), a per-field null here (that ONE field hasn't
+// reported a live value yet) is NOT simply dropped from the rollup: with a
+// file-based check, buildCheckSteps() always evaluates every field of a
+// step in one pass, so partial data never happens in practice -- but with
+// live CC feedback each field arrives independently as its own knob gets
+// turned, so it's entirely normal for e.g. Envelope 1's Attack to have
+// reported in while Decay/Sustain/Release haven't yet. Dropping those
+// null fields (as if they simply didn't exist) would let a step read as
+// "ok" -- and auto-tick its checkbox -- from just ONE of four fields
+// happening to match, which is exactly the kind of premature/incorrect
+// status this whole area got re-examined for. A field still pending now
+// blocks "ok" specifically, while still allowing "changed" to show once
+// real progress is visible, so the step doesn't misleadingly look
+// untouched either.
+function liveStepStatus(step) {
+  if (!currentCheckTargetObj) return null;
+  const statuses = step.checkFields
+    .map(f => DelugeMidiFollowModule.liveFieldStatus(midiFollow, f.path, currentCheckTargetObj, checkSettings));
+  if (statuses.every(s => s === null)) return null;
+  if (statuses.some(s => s === 'unexpected')) return 'unexpected';
+  if (statuses.every(s => s === 'ok')) return 'ok';
+  if (statuses.every(s => s === 'untouched' || s === null)) return 'untouched';
+  return 'changed';
 }
 
 // Anything with an "unexpected" status has, by definition, no home in the
@@ -3610,14 +3958,16 @@ function renderGuide(item, sections) {
   const checked = loadChecked(item.id);
   const container = document.getElementById('guideSections');
   container.innerHTML = '';
-
-  const hint = document.createElement('div');
-  hint.className = 'menu-hint';
-  hint.innerHTML = `<b>Reading the steps:</b> ${shift('PARAM')} means hold ${kbd('SHIFT')} and press the named pad on the
-    grid (printed per function column, e.g. all OSC1 params share a column), then turn ${kbd('SELECT')} to change
-    the value. Every shortcut is also reachable the slower way via the nested SOUND menu: press ${kbd('SELECT')} to
-    open it, turn to navigate, press to drill in. Source: <i>Deluge Official Manual</i>, &sect;4.8 &amp; &sect;6.1.`;
-  container.appendChild(hint);
+  // Repopulated below, one entry per rendered "live" step -- refreshLiveSteps()
+  // (called from the MIDI Follow CC subscription) walks just this small list
+  // instead of re-running renderGuide() on every incoming CC, which can fire
+  // many times a second while a knob is turned.
+  renderedLiveSteps = [];
+  // The "Reading the steps" (SHIFT+PARAM syntax) explanation used to live
+  // here as its own box above every guide -- moved into the User Guide
+  // (openUserGuide()) instead, reachable from the top bar, so it's there
+  // when actually needed without permanently eating space in the guide a
+  // returning user already knows how to read.
 
   let stepIndex = 0;
   sections.forEach((section) => {
@@ -3629,15 +3979,27 @@ function renderGuide(item, sections) {
     block.appendChild(title);
     for (const step of section.steps) {
       const stepId = String(stepIndex++);
-      // A perfect on-device match ticks the box for real, same as the user
-      // checking it off by hand -- it persists like any other manual tick.
-      const checkStatus = stepCheckStatus(step);
-      if (checkStatus === 'ok' && !checked[stepId]) {
+      // Live steps never consult the file-based check result, and vice
+      // versa -- see isLiveStep()'s comment for why a step is never allowed
+      // to blend the two.
+      const live = deluge.connected && isLiveStep(step);
+      const checkStatus = live ? liveStepStatus(step) : stepCheckStatus(step);
+      if (live) {
+        // Live: the tick tracks the device in real time, both ways -- see
+        // syncLiveChecked()'s own comment for why that's different from...
+        syncLiveChecked(checked, item.id, stepId, checkStatus);
+      } else if (checkStatus === 'ok' && !checked[stepId]) {
+        // ...this file-based "Check now" case: a perfect match ticks the
+        // box for real, same as the user checking it off by hand, but only
+        // ever forward -- it persists like any other manual tick even if a
+        // later check finds the same field no longer matching (each click
+        // is a deliberate snapshot/milestone, not a live truth feed).
         checked[stepId] = true;
         saveChecked(item.id, checked);
       }
       const el = document.createElement('div');
       el.className = 'step' + (checked[stepId] ? ' done' : '') + (checkStatus ? ` check-${checkStatus}` : '');
+      if (live) el.classList.toggle('step-live-waiting', checkStatus === null);
       const cb = document.createElement('input');
       cb.type = 'checkbox';
       cb.checked = !!checked[stepId];
@@ -3648,13 +4010,29 @@ function renderGuide(item, sections) {
         updateProgressText(item.id);
         renderLibrary(document.getElementById('searchBox').value);
       });
+      // "live" (device connected, MIDI Follow covers every field of this
+      // step) vs. "check pending..." (device connected, but this step needs
+      // an explicit Check now -- and none has run yet this preset). Neither
+      // shows at all without a connected Deluge, so the plain read-the-guide
+      // experience is untouched.
+      let badgeHtml = '';
+      if (deluge.connected && step.checkFields && step.checkFields.length) {
+        badgeHtml = live
+          ? `<span class="step-badge step-badge-live">live</span>`
+          : (!lastCheckFieldStatus ? `<span class="step-badge step-badge-pending">check pending&hellip;</span>` : '');
+      }
       const body = document.createElement('div');
       body.className = 'step-body';
-      body.innerHTML = `<div class="step-title">${step.title}</div><div class="step-text">${isBeginnerMode() ? step.beginner : step.expert}</div>${renderStepFootnotes(step)}`;
+      body.innerHTML = `<div class="step-title">${step.title}${badgeHtml}</div><div class="step-text">${isBeginnerMode() ? step.beginner : step.expert}</div>${renderStepFootnotes(step)}`;
       // Color each individual instruction fragment (e.g. "SHIFT+ATTACK 31")
       // right where it's written, not in a separate list -- see ck() above
       // for how these markers get embedded into a step's HTML.
-      if (lastCheckFieldStatus) {
+      if (live) {
+        for (const spanEl of body.querySelectorAll('[data-check-path]')) {
+          applyLiveSpanVisuals(spanEl);
+        }
+        renderedLiveSteps.push({ el, body, step, stepId });
+      } else if (lastCheckFieldStatus) {
         for (const spanEl of body.querySelectorAll('[data-check-path]')) {
           const s = lastCheckFieldStatus.get(spanEl.dataset.checkPath);
           if (s) spanEl.classList.add(`check-${s.status}`);
@@ -3680,7 +4058,6 @@ function updateProgressText(id) {
 // Wiring
 // ---------------------------------------------------------------------------
 document.getElementById('pickFolderBtn').addEventListener('click', () => document.getElementById('folderInput').click());
-document.getElementById('pickFilesBtn').addEventListener('click', () => document.getElementById('filesInput').click());
 document.getElementById('folderInput').addEventListener('change', e => ingestFiles(e.target.files));
 document.getElementById('filesInput').addEventListener('change', e => ingestFiles(e.target.files, { autoSelectSingle: true }));
 document.getElementById('searchBox').addEventListener('input', e => renderLibrary(e.target.value));
@@ -3701,6 +4078,19 @@ document.getElementById('tipsToggle').addEventListener('change', e => {
   saveUiBool('showTips', e.target.checked);
   if (currentPreset) selectPreset(currentPreset);
 });
+// Landscape-phone-only collapse toggle for the preset-list sidebar (see the
+// `body.sidebar-collapsed` rules inside the `orientation: landscape` media
+// query in styles.css) -- the toggle button itself is display:none outside
+// that breakpoint, so this listener is harmless (never reachable) elsewhere.
+// Deliberately not persisted to localStorage: it's a transient space trade-
+// off for the current viewport, not a durable preference like the other
+// toggles above, and defaulting back to expanded on reload means a user
+// who rotates back to portrait (or reopens on desktop) never has to wonder
+// where their preset list went.
+document.getElementById('libraryCollapseToggle').addEventListener('click', function () {
+  const collapsed = document.body.classList.toggle('sidebar-collapsed');
+  this.setAttribute('aria-expanded', String(!collapsed));
+});
 document.getElementById('resetProgressBtn').addEventListener('click', () => {
   if (!currentPreset) return;
   if (!confirm('Reset progress for this preset?')) return;
@@ -3708,6 +4098,8 @@ document.getElementById('resetProgressBtn').addEventListener('click', () => {
   selectPreset(currentPreset);
 });
 document.getElementById('glossaryBtn').addEventListener('click', openGlossary);
+document.getElementById('userGuideBtn').addEventListener('click', openUserGuide);
+document.getElementById('userGuideLinkCheck').addEventListener('click', openUserGuide);
 document.getElementById('printBtn').addEventListener('click', printCheatSheet);
 document.getElementById('tabBar').addEventListener('click', e => {
   const btn = e.target.closest('.tab-btn');
@@ -3754,6 +4146,13 @@ const deluge = new DelugeSysex();
 const delugeCheck = new DelugeCheck(deluge);
 let checkSettings = loadSettings();
 let lastCheckResult = null;
+// Live MIDI Follow feedback tracking -- see modules/deluge-midi-follow.js
+// for the CC<->field mapping and per-field status logic; this instance just
+// owns the connection-lifetime state (started on connect, stopped on
+// disconnect) and the one onUpdate() subscription that keeps rendered live
+// steps in sync (refreshLiveSteps(), defined next to renderGuide() above).
+const midiFollow = new DelugeMidiFollowModule.MidiFollowTracker(deluge);
+midiFollow.onUpdate(() => refreshLiveSteps());
 
 const delugeConnectBtn = document.getElementById('delugeConnectBtn');
 const delugeStatusEl = document.getElementById('delugeStatus');
@@ -3761,6 +4160,16 @@ function setDelugeStatus(text, connected) {
   delugeStatusEl.textContent = text;
   delugeStatusEl.classList.toggle('connected', !!connected);
   delugeConnectBtn.textContent = connected ? 'Disconnect Deluge' : 'Connect Deluge…';
+}
+// Refreshes everything that depends on connected-or-not rather than on any
+// particular check/live result: the "some steps are live" hint under the
+// check panel, and (if a preset is loaded) the guide itself, so live/check-
+// pending badges appear or disappear immediately on connect/disconnect
+// instead of only after the next preset selection.
+function onDelugeConnectionChanged() {
+  const hint = document.getElementById('midiFollowHint');
+  if (hint) hint.hidden = !deluge.connected;
+  if (currentPreset && currentPatch) renderGuide(currentPreset, buildGuide(currentPatch));
 }
 // Web MIDI's requestMIDIAccess() must be called directly from a click
 // handler (a user-gesture requirement), so every entry point below that
@@ -3778,11 +4187,18 @@ async function ensureDelugeConnected() {
     throw new Error('No MIDI device with "deluge" in its port name was found. Make sure it is plugged in and powered on.');
   }
   setDelugeStatus('connected', true);
+  // Best-effort (never throws -- see MidiFollowTracker.start()): reads the
+  // device's real SETTINGS/MIDIFollow.XML, falling back to the documented
+  // default mapping if that file doesn't exist or can't be parsed.
+  await midiFollow.start();
+  onDelugeConnectionChanged();
 }
 delugeConnectBtn.addEventListener('click', async () => {
   if (deluge.connected) {
     deluge.disconnect();
+    midiFollow.stop();
     setDelugeStatus('not connected', false);
+    onDelugeConnectionChanged();
     return;
   }
   setDelugeStatus('connecting…', false);
@@ -4133,8 +4549,59 @@ document.getElementById('loadFromDelugeBtn').addEventListener('click', async () 
   }
 });
 
+// "Check now" reads whatever progress file is currently sitting on the SD
+// card -- easy to click before actually saving there, especially since
+// nothing else in this flow forces a save first. Asked once per click
+// unless permanently dismissed via "Don't ask again" (persisted the same
+// way as the other UI_BOOL_KEYS toggles). Resolves true to proceed with the
+// check, false if the user cancelled.
+function confirmSavedToSdCard() {
+  if (loadUiBool('skipSaveConfirm', false)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let resolved = false;
+    const finish = (value) => { if (resolved) return; resolved = true; closeModal(); resolve(value); };
+    openModal(box => {
+      const h = document.createElement('h3');
+      h.textContent = 'Saved to the SD card?';
+      box.appendChild(h);
+      const p = document.createElement('p');
+      p.textContent = "Check now reads whatever progress file is currently on the Deluge's SD card. Make sure you saved your in-progress patch there first, or you'll just be re-checking the old version.";
+      box.appendChild(p);
+      const label = document.createElement('label');
+      label.className = 'modal-checkbox-row';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(" Don't ask again"));
+      box.appendChild(label);
+      const actions = document.createElement('div');
+      actions.className = 'modal-actions';
+      const cancelBtn = document.createElement('button');
+      cancelBtn.className = 'btn-secondary';
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.addEventListener('click', () => finish(false));
+      const okBtn = document.createElement('button');
+      okBtn.className = 'btn-primary';
+      okBtn.textContent = 'Yes, check now';
+      okBtn.addEventListener('click', () => {
+        if (cb.checked) saveUiBool('skipSaveConfirm', true);
+        finish(true);
+      });
+      actions.appendChild(cancelBtn);
+      actions.appendChild(okBtn);
+      box.appendChild(actions);
+    });
+    // Dismissing via the overlay backdrop counts as Cancel too, rather than
+    // leaving this promise unresolved forever.
+    document.getElementById('modalOverlay').onclick = (e) => {
+      if (e.target === e.currentTarget) finish(false);
+    };
+  });
+}
+
 document.getElementById('checkOnDeviceBtn').addEventListener('click', async () => {
   if (!currentPreset) { alert('Pick a preset first.'); return; }
+  if (!(await confirmSavedToSdCard())) return;
   const statusEl = document.getElementById('deviceCheckStatus');
   try {
     statusEl.textContent = 'Connecting…';
@@ -4190,4 +4657,97 @@ document.getElementById('checkSettingsBtn').addEventListener('click', () => {
     close.addEventListener('click', closeModal);
     box.appendChild(close);
   });
+});
+
+// Diagnostic view for exactly the kind of "live feedback isn't showing up"
+// question this got built to answer: instead of guessing at the connection
+// (wrong port, MIDI Follow not enabled on the device, wrong CC numbers, ...),
+// show every raw message MidiFollowTracker's monitored ports actually see.
+// Reachable from the top bar (not gated behind a loaded preset) since the
+// most useful moment to check it is often right after connecting, before
+// picking a preset at all.
+function formatMidiLogEntry(e) {
+  const t = new Date(e.time);
+  const time = t.toLocaleTimeString('en-GB', { hour12: false }) + '.' + String(t.getMilliseconds()).padStart(3, '0');
+  let detail;
+  if (e.label === 'CC') {
+    if (e.fieldPaths && e.fieldPaths.length) {
+      detail = `CC ${e.cc} = ${e.value} &rarr; <b>${e.fieldPaths.map(escapeHtml).join(', ')}</b> <span class="midi-monitor-tag">live</span>`;
+    } else if (e.params && e.params.length) {
+      detail = `CC ${e.cc} = ${e.value} &rarr; ${escapeHtml(e.params.join(', '))} <span class="midi-monitor-dim">(no guide step checks this field)</span>`;
+    } else {
+      detail = `CC ${e.cc} = ${e.value} <span class="midi-monitor-dim">(not in the current CC mapping)</span>`;
+    }
+  } else {
+    detail = `${escapeHtml(e.label)} <span class="midi-monitor-dim">[${e.raw.map(b => b.toString(16).padStart(2, '0')).join(' ')}]</span>`;
+  }
+  return `<div class="midi-monitor-row"><span class="midi-monitor-time">${time}</span><span class="midi-monitor-ch">ch${e.channel}</span><span class="midi-monitor-detail">${detail}</span></div>`;
+}
+
+document.getElementById('midiMonitorBtn').addEventListener('click', () => {
+  let unsubscribe = null;
+  let pendingRender = false;
+  const close = () => { if (unsubscribe) unsubscribe(); closeModal(); };
+  openModal(box => {
+    box.classList.add('midi-monitor-box');
+    const h = document.createElement('h3');
+    h.textContent = 'MIDI Monitor';
+    box.appendChild(h);
+    const info = document.createElement('div');
+    box.appendChild(info);
+    const toolbar = document.createElement('div');
+    toolbar.className = 'midi-monitor-toolbar';
+    const clearBtn = document.createElement('button');
+    clearBtn.className = 'btn-link';
+    clearBtn.textContent = 'Clear log';
+    clearBtn.addEventListener('click', () => { midiFollow.clearLog(); renderLog(); });
+    toolbar.appendChild(clearBtn);
+    box.appendChild(toolbar);
+    const logEl = document.createElement('div');
+    logEl.className = 'midi-monitor-log';
+    box.appendChild(logEl);
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'btn-secondary';
+    closeBtn.textContent = 'Close';
+    closeBtn.style.marginTop = '14px';
+    closeBtn.addEventListener('click', close);
+    box.appendChild(closeBtn);
+
+    function renderInfo() {
+      if (!deluge.connected) {
+        info.innerHTML = `<p>Not connected. Click <b>Connect Deluge&hellip;</b> first, then reopen this.</p>`;
+        return;
+      }
+      const ports = midiFollow.monitoredPortNames;
+      if (!ports.length) {
+        info.innerHTML = `<p class="midi-monitor-warn">Connected, but no MIDI input with "deluge" in its name is open -- nothing can arrive here. Check the browser's MIDI permission and that the Deluge is still plugged in and powered on.</p>`;
+        return;
+      }
+      const mappingSrc = midiFollow.usingDeviceMapping
+        ? "the device's own SETTINGS/MIDIFollow.XML"
+        : 'the documented default mapping (no MIDIFollow.XML found/readable on this device)';
+      info.innerHTML = `<p>Listening on: ${ports.map(p => `<code>${escapeHtml(p)}</code>`).join(', ')}<br>
+        CC mapping: ${mappingSrc}, ${midiFollow.mappedParamCount} parameters known.</p>`;
+    }
+
+    function renderLog() {
+      const log = midiFollow.getLog();
+      if (!log.length) {
+        logEl.innerHTML = `<p class="empty-note">No messages received yet. On the Deluge: <b>SETTINGS &rarr; MIDI &rarr; MIDI-FOLLOW &rarr; FEEDBACK &rarr; CHANNEL</b> &mdash; make sure that's set to an actual channel, not OFF, then turn any knob. If nothing still shows up here, MIDI Follow's feedback may be coming out of a different USB-MIDI port than expected -- try reconnecting.</p>`;
+        return;
+      }
+      // Newest first, capped display (MidiFollowTracker's own log already
+      // caps storage at 300 -- this just keeps the DOM itself small too).
+      logEl.innerHTML = log.slice(-150).reverse().map(formatMidiLogEntry).join('');
+    }
+
+    renderInfo();
+    renderLog();
+    unsubscribe = midiFollow.onRawMessage(() => {
+      if (pendingRender) return;
+      pendingRender = true;
+      requestAnimationFrame(() => { pendingRender = false; renderInfo(); renderLog(); });
+    });
+  });
+  document.getElementById('modalOverlay').onclick = (e) => { if (e.target === e.currentTarget) close(); };
 });

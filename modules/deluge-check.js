@@ -408,10 +408,24 @@ function resolveFieldValues(field, targetObj, actualObj, initObj) {
       initValue: i ? i.amount : undefined,
     };
   }
+  const initValue = getValueAtPath(initObj, field.path);
+  let targetValue = getValueAtPath(targetObj, field.path);
+  // BUG FIX: a preset's XML can omit an attribute entirely when it happens
+  // to match the firmware's own built-in default (some export/editing
+  // tools skip writing default-valued attributes) -- leaving targetValue
+  // as undefined in that case meant valuesMatch() compared it as the
+  // string "" against every real value, which can never equal init OR any
+  // value the user dials in. That field could then never read "ok", no
+  // matter what -- it just oscillated between "untouched" (near init) and
+  // "changed" (away from it) forever. Falling back to initValue here
+  // mirrors what actually happens when the Deluge itself loads such a
+  // preset (a missing attribute just means "use the default"), which is
+  // also the correct target to check against.
+  if (targetValue === undefined) targetValue = initValue;
   return {
-    targetValue: getValueAtPath(targetObj, field.path),
+    targetValue,
     actualValue: getValueAtPath(actualObj, field.path),
-    initValue: getValueAtPath(initObj, field.path),
+    initValue,
   };
 }
 
@@ -424,11 +438,31 @@ function resolveFieldValues(field, targetObj, actualObj, initObj) {
  * dezimal, je nach XML-Format). Diese Funktion versucht, einen Rohwert
  * in eine Zahl umzuwandeln; gibt NaN zurück, wenn es kein numerischer
  * Parameter ist (z.B. "saw", "square" bei Oscillator-Typ).
+ *
+ * An 8-digit hex value here is always the Deluge's signed 32-bit
+ * fixed-point encoding for a continuous parameter (0x80000000 = -2^31 ..
+ * 0x7FFFFFFF = 2^31-1, same convention app.js's own signed32()/isQ31()
+ * use) -- BUG FIX: this used to just parseInt(str, 16) without the sign
+ * flip, which reads 0x80000000 as the plain positive integer 2147483648,
+ * landing it numerically ADJACENT to 0x7FFFFFFF (2147483647) instead of
+ * ~4.3 billion apart, its true distance as opposite ends of the real
+ * range. That silently broke valuesMatch() for exactly the pairs most
+ * likely to occur in practice -- an init value near one extreme compared
+ * against a target near the other -- e.g. it could report a value sitting
+ * at its untouched init default as "matching" a target at the opposite
+ * extreme, or report a target that's genuinely far from default as
+ * "targetIsDefault" (mislabeling a real "changed, not there yet" field as
+ * "unexpected" instead).
  */
 function parseNumericValue(raw) {
   if (raw === undefined || raw === null) return NaN;
   if (typeof raw === "number") return raw;
   const str = String(raw).trim();
+  if (/^0x[0-9a-f]{8}$/i.test(str)) {
+    let n = parseInt(str, 16);
+    if (n > 0x7fffffff) n -= 0x100000000;
+    return n;
+  }
   if (/^0x[0-9a-f]+$/i.test(str)) return parseInt(str, 16);
   if (/^-?\d+$/.test(str)) return parseInt(str, 10);
   if (/^-?\d*\.\d+$/.test(str)) return parseFloat(str);

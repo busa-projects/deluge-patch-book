@@ -14,11 +14,11 @@ leave your browser.
 1. Double-click **`index.html`** to open it (Chrome or Edge recommended — the
    folder picker below relies on `webkitdirectory`, which Safari/Firefox
    support less reliably).
-2. Click **"Choose synths folder…"** and select your `synths` directory (or
-   use **"Choose individual XML files…"** to pick specific presets instead).
-   This is the `SYNTHS` folder from your Deluge's SD card — copy it onto your
+2. Click **"Choose synths folder…"** and select your `synths` directory. This
+   is the `SYNTHS` folder from your Deluge's SD card — copy it onto your
    computer first (e.g. by plugging the SD card into a card reader); the app
-   reads it locally and never uploads anything.
+   reads it locally and never uploads anything. (An in-app **User Guide**,
+   top right, covers this and everything else below in one place.)
    - Once loaded, use the **filter chips** above the preset list (next to
      the search box) to narrow it down: **engine** (Subtractive/FM/Ring
      Mod — pick one), **oscillator source** (Waveform/Sample/Multisample —
@@ -94,7 +94,7 @@ to the device directly:
   card) and enable the Engine/Oscillator-source filters for it. Arp/Unison/
   Custom cables/Sidechain aren't offered here — those live too far into a
   real preset file to detect reliably from a short read.
-- **Check on device…** (above the step list) reads a progress file back off
+- **Check now…** (above the step list) reads a progress file back off
   the Deluge and compares every parameter it knows how to check against the
   preset you're rebuilding, field by field — so you can save your
   in-progress patch to the SD card as you go and see exactly what still
@@ -102,16 +102,42 @@ to the device directly:
   arpeggiator, effects, sidechain and distortion; it does not yet check
   patch-cable routings or gold-knob reassignments (those are lists in the
   XML with a shape that's ambiguous to check generically — see the comment
-  above `buildCheckSteps()` in `app.js`).
+  above `buildCheckSteps()` in `app.js`). Asks once per session whether
+  you've actually saved to the SD card first (skippable for good via
+  "Don't ask again").
 - **Check settings…** lets you loosen or tighten how close a value needs to
   be to count as "matching" (useful since a knob is never turned to the
   exact same raw value twice), globally or per parameter.
+- **Live values, no SD card needed**: if the Deluge has MIDI Follow Mode
+  enabled (Community Firmware's own feature — sends MIDI CC feedback for
+  ~80 continuous parameters whenever you turn a knob), a handful of steps
+  (currently: both envelopes, oscillator/noise levels, pan) pick that up
+  automatically and tag themselves **live** — no "Check now" click needed
+  for those. Everything MIDI Follow can't cover
+  (patch cables, enum-style settings like oscillator type or filter mode,
+  Unison, Sidechain timing, …) still needs a real file-based check. A step
+  never mixes the two: if even one of its fields falls outside MIDI Follow's
+  coverage, the whole step stays file-check-only. See
+  `modules/deluge-midi-follow.js` for the exact field coverage and the
+  default CC mapping.
 
 This is all still 100% local: MIDI SysEx is a direct USB connection between
 your browser and the Deluge, nothing is uploaded anywhere. The connection
 code lives in `modules/` and is only touched by these buttons — the rest of
 the app (folder/file pickers, guide, mod matrix, signal path) never depends
 on a Deluge being connected.
+
+## Mobile / phone use
+
+The app works on a phone browser too — pick presets, read the build guide,
+tap through the Mod Matrix/Signal Path/Compare tabs and open the WebAudio
+"Hear it" demos, all with the library and guide chrome laid out as one
+normal scrolling page (rather than the desktop's fixed two-pane layout) and
+touch-sized filter chips/sliders below an 800px-wide viewport. The Signal
+Path and Compare diagrams are wide enough that they scroll horizontally
+inside their own frame on a narrow screen — that's expected, not a bug.
+Web MIDI (**Connect Deluge…**) still depends on your mobile browser
+supporting it, same as on desktop.
 
 ## Files
 
