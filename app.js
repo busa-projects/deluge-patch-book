@@ -263,6 +263,8 @@ const INIT = {
   delaySyncLevel: '7',
   reverbAmount: '0x80000000',
   arpMode: 'off',
+  arpeggiatorRate: '0x00000000',
+  arpeggiatorGate: '0x00000000',
   modulatorAmount: '0x80000000',
   clippingAmount: '0',
   bitCrush: '0x80000000',
@@ -1196,11 +1198,32 @@ function buildGuide(patch) {
       [cf('defaultParams.volume', 'Level')],
       { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Level)', 88), conceptKey: 'mixer.level' }));
   }
-  if (dp.oscBVolume && q31Differs(dp.oscBVolume, INIT.oscBVolume)) {
+  // Previously assumed OSC1 always stays at its own default ("near full")
+  // whenever OSC2's level was the one that changed, and never checked
+  // oscAVolume itself at all -- silently dropping OSC1's own level
+  // whenever IT was the one actually changed (reported directly against
+  // real hardware: "osc1 level step missing", a preset with OSC1 LEVEL
+  // turned down and OSC2 left at default). Now checks both independently
+  // and only claims "stays near full" about whichever one truly didn't
+  // change.
+  const oscAVolChanged = dp.oscAVolume && q31Differs(dp.oscAVolume, INIT.oscAVolume);
+  const oscBVolChanged = dp.oscBVolume && q31Differs(dp.oscBVolume, INIT.oscBVolume);
+  if (oscAVolChanged || oscBVolChanged) {
+    const beginnerParts = [
+      oscAVolChanged && ck('defaultParams.oscAVolume', `${shift('OSC1 LEVEL')} to ${val(dv(dp.oscAVolume))}`),
+      oscBVolChanged && ck('defaultParams.oscBVolume', `${shift('OSC2 LEVEL')} to ${val(dv(dp.oscBVolume))}`),
+    ].filter(Boolean);
+    const expertParts = [
+      oscAVolChanged && ck('defaultParams.oscAVolume', `OSC1 level ${val(rawPct(dp.oscAVolume) + '%')}`),
+      oscBVolChanged && ck('defaultParams.oscBVolume', `OSC2 level ${val(rawPct(dp.oscBVolume) + '%')}`),
+    ].filter(Boolean);
+    const caveat = (oscAVolChanged && oscBVolChanged) ? ''
+      : oscAVolChanged ? ` (OSC2 stays near full via ${kbd('OSC2 LEVEL')})`
+      : ` (OSC1 stays near full via ${kbd('OSC1 LEVEL')})`;
     mixSteps.push(makeStep('Balance OSC1 / OSC2',
-      `${ck('defaultParams.oscBVolume', `${shift('OSC2 LEVEL')} up to ${val(dv(dp.oscBVolume))}`)} (OSC1 stays near full via ${kbd('OSC1 LEVEL')}).`,
-      `${ck('defaultParams.oscBVolume', `OSC2 level: ${val(rawPct(dp.oscBVolume) + '%')}`)} (OSC1 stays near full).`,
-      [cf('defaultParams.oscBVolume', 'OSC2 level')],
+      `${beginnerParts.join('. ')}${caveat}.`,
+      `${expertParts.join(', ')}${caveat}.`,
+      [oscAVolChanged && cf('defaultParams.oscAVolume', 'OSC1 level'), oscBVolChanged && cf('defaultParams.oscBVolume', 'OSC2 level')].filter(Boolean),
       { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Oscillator column)', 88), conceptKey: 'mixer.balance' }));
   }
   if (dp.noiseVolume && q31Differs(dp.noiseVolume, INIT.noiseVolume)) {
@@ -1328,7 +1351,15 @@ function buildGuide(patch) {
     const rateKey = `lfo${n}Rate`;
     const routed = cables.some(c => c.source === key);
     const rateChanged = dp[rateKey] && q31Differs(dp[rateKey], INIT[rateKey] || '0x00000000');
-    if (!lfo || (!routed && !rateChanged)) return;
+    // Sync being turned on is its own reason to show this LFO's step, same
+    // as being routed or having its rate changed -- previously missing
+    // from this gate entirely, so a preset with ONLY syncLevel set (rate
+    // still default, not yet routed anywhere) showed no LFO step at all,
+    // silently dropping the one place syncLevel is ever mentioned.
+    // Reported directly against real hardware ("lfo sync steps missing")
+    // using a test patch built exactly that way.
+    const syncChanged = lfo && lfo.syncLevel && lfo.syncLevel !== '0';
+    if (!lfo || (!routed && !rateChanged && !syncChanged)) return;
     // Rate gets its own step, split off from Shape/Sync: Rate is a real
     // MIDI-Follow-mappable param, but Shape (an enum) and Sync (a list, see
     // syncLevelName()'s own comment) are neither -- bundling all three into
@@ -1509,13 +1540,42 @@ function buildGuide(patch) {
 
   // --- Arpeggiator ----------------------------------------------------
   const arp = patch.arpeggiator;
+  const arpSteps = [];
   if (arp && arp.mode && arp.mode !== 'off') {
-    push('Arpeggiator', [makeStep('Enable arpeggiator',
-      `${ck('arpeggiator.mode', `${shift('MODE')} (under VOICE) to ${val(arp.mode.toUpperCase())}`)}${arp.numOctaves ? `. ${ck('arpeggiator.numOctaves', `${shift('NUMBER OF OCTAVES')} to ${val(arp.numOctaves)}`)}` : ''}${dp.arpeggiatorGate ? `. ${ck('defaultParams.arpeggiatorGate', `${shift('GATE')} to ${val(dv(dp.arpeggiatorGate))}`)}` : ''}${dp.arpeggiatorRate ? `. ${ck('defaultParams.arpeggiatorRate', `${shift('RATE')} to ${val(dv(dp.arpeggiatorRate))}`)}` : ''}.`,
+    arpSteps.push(makeStep('Enable arpeggiator',
+      `${ck('arpeggiator.mode', `${shift('MODE')} (under VOICE) to ${val(arp.mode.toUpperCase())}`)}${arp.numOctaves ? `. ${ck('arpeggiator.numOctaves', `${shift('NUMBER OF OCTAVES')} to ${val(arp.numOctaves)}`)}` : ''}.`,
       `${ck('arpeggiator.mode', `Arpeggiator: ${val(arp.mode)} mode`)}${arp.numOctaves ? `, ${ck('arpeggiator.numOctaves', `${arp.numOctaves} octave(s)`)}` : ''}.`,
-      [cf('arpeggiator.mode', 'Mode'), cf('arpeggiator.numOctaves', 'Octaves'), cf('defaultParams.arpeggiatorGate', 'Gate'), cf('defaultParams.arpeggiatorRate', 'Rate')],
-      { manualRef: manualRef('§4.12 "Arpeggiator"', 108), conceptKey: 'arpeggiator' })]);
+      [cf('arpeggiator.mode', 'Mode'), cf('arpeggiator.numOctaves', 'Octaves')],
+      { manualRef: manualRef('§4.12 "Arpeggiator"', 108), conceptKey: 'arpeggiator' }));
   }
+  // Rate/Gate get their own step, independent of whether the arp is
+  // currently ON -- both are real MIDI-Follow-mappable params (see
+  // FIELD_TO_MIDIFOLLOW_PARAM: arpRate/arpGate), and a non-default value
+  // here still matters for an exact rebuild even while Mode is "off" --
+  // it's what the arp will use the moment it's turned on. Previously
+  // bundled into the SAME step as Mode (an enum) AND the whole step was
+  // gated on mode !== 'off', so a preset with rate/gate set but the arp
+  // not yet enabled showed NOTHING for either. Reported directly against
+  // real hardware ("ARP Steps missing") using a test patch that set rate/
+  // gate without also enabling the arp.
+  const arpRateChanged = dp.arpeggiatorRate && q31Differs(dp.arpeggiatorRate, INIT.arpeggiatorRate);
+  const arpGateChanged = dp.arpeggiatorGate && q31Differs(dp.arpeggiatorGate, INIT.arpeggiatorGate);
+  if (arpRateChanged || arpGateChanged) {
+    const beginnerParts = [
+      arpGateChanged && ck('defaultParams.arpeggiatorGate', `${shift('GATE')} (under VOICE) to ${val(dv(dp.arpeggiatorGate))}`),
+      arpRateChanged && ck('defaultParams.arpeggiatorRate', `${shift('RATE')} (under VOICE) to ${val(dv(dp.arpeggiatorRate))}`),
+    ].filter(Boolean);
+    const expertParts = [
+      arpGateChanged && ck('defaultParams.arpeggiatorGate', `gate ${val(rawPct(dp.arpeggiatorGate) + '%')}`),
+      arpRateChanged && ck('defaultParams.arpeggiatorRate', `rate ${val(rawPct(dp.arpeggiatorRate) + '%')}`),
+    ].filter(Boolean);
+    arpSteps.push(makeStep('Arpeggiator rate/gate',
+      `${beginnerParts.join('. ')}.`,
+      `Arpeggiator ${expertParts.join(', ')}.`,
+      [cf('defaultParams.arpeggiatorGate', 'Gate'), cf('defaultParams.arpeggiatorRate', 'Rate')],
+      { manualRef: manualRef('§4.12 "Arpeggiator"', 108), conceptKey: 'arpeggiator' }));
+  }
+  if (arpSteps.length) push('Arpeggiator', arpSteps);
 
   // --- Mod FX / Delay / Reverb / Sidechain ----------------------------
   const fxSteps = [];

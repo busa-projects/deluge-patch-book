@@ -1,6 +1,6 @@
 # Deluge Patch Book
 
-**Version:** Early alpha
+**Version:** Beta
 
 A step-by-step build guide for Synthstrom Deluge presets — pick a preset from your
 `synths` folder and it shows you how to dial it in from an init patch, plus a
@@ -99,27 +99,39 @@ to the device directly:
   preset you're rebuilding, field by field — so you can save your
   in-progress patch to the SD card as you go and see exactly what still
   differs. It covers oscillators, mixer levels, filter, envelopes, LFOs,
-  arpeggiator, effects, sidechain and distortion; it does not yet check
-  patch-cable routings or gold-knob reassignments (those are lists in the
+  arpeggiator, effects, sidechain, distortion, and the modulation matrix
+  (patch cable routing, depth, polarity, and chained "double mod" depth
+  modulators); it does not yet check gold-knob reassignments (a list in the
   XML with a shape that's ambiguous to check generically — see the comment
   above `buildCheckSteps()` in `app.js`). Asks once per session whether
   you've actually saved to the SD card first (skippable for good via
-  "Don't ask again").
+  "Don't ask again"). A single corrupted SysEx reply (rare, more likely on
+  a large directory listing) is retried automatically before surfacing an
+  error.
 - **Check settings…** lets you loosen or tighten how close a value needs to
   be to count as "matching" (useful since a knob is never turned to the
   exact same raw value twice), globally or per parameter.
 - **Live values, no SD card needed**: if the Deluge has MIDI Follow Mode
   enabled (Community Firmware's own feature — sends MIDI CC feedback for
-  ~80 continuous parameters whenever you turn a knob), a handful of steps
-  (currently: both envelopes, oscillator/noise levels, pan) pick that up
-  automatically and tag themselves **live** — no "Check now" click needed
-  for those. Everything MIDI Follow can't cover
-  (patch cables, enum-style settings like oscillator type or filter mode,
-  Unison, Sidechain timing, …) still needs a real file-based check. A step
-  never mixes the two: if even one of its fields falls outside MIDI Follow's
-  coverage, the whole step stays file-check-only. See
+  ~80 continuous parameters whenever you turn a knob), around 30 continuous
+  parameters (oscillator/noise levels, oscillator pulse width, pan, both
+  envelopes, filter frequency/resonance, LFO rates, Mod-FX rate/depth, delay
+  rate/amount, reverb, arpeggiator rate/gate, distortion, EQ, portamento)
+  pick that up automatically and tag themselves **live** — no "Check now"
+  click needed for those. Everything MIDI Follow can't cover (patch cables,
+  enum-style settings like oscillator type/filter mode/sync level, Unison,
+  Sidechain timing, …) still needs a real file-based check. A step never
+  mixes the two: if even one of its fields falls outside MIDI Follow's
+  coverage, the whole step stays file-check-only — which is also why some
+  parameters (e.g. Delay/LFO rate vs. their own Sync) live in their own
+  separate steps from a field they're otherwise closely related to. See
   `modules/deluge-midi-follow.js` for the exact field coverage and the
   default CC mapping.
+- **MIDI Monitor…** (top bar) shows every raw MIDI message arriving from the
+  Deluge, decoded with its resolved field path where one applies — useful
+  for confirming MIDI Follow feedback is actually reaching the browser.
+  Clock and transport (Start/Continue/Stop) messages are filtered out so a
+  running sequencer doesn't flood it.
 
 This is all still 100% local: MIDI SysEx is a direct USB connection between
 your browser and the Deluge, nothing is uploaded anywhere. The connection

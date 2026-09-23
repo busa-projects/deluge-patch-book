@@ -74,6 +74,19 @@ const SYSEX_END = 0xf7;
 const SESSION_TIMEOUT_MS = 10000;
 const COMMAND_TIMEOUT_MS = 8000;
 const MAX_MESSAGES_PER_SESSION = 100;
+// A large SysEx reply (e.g. a directory listing with many entries, or a
+// read chunk near WRITE/READ_CHUNK_SIZE) spans more individual MIDI bytes,
+// and with them a higher chance any ONE gets dropped/corrupted by the
+// transport (USB-MIDI drivers/hardware are not perfectly reliable for
+// large sustained transfers) -- reported directly: "Check failed: Bad
+// control character in string literal in JSON at position 814 (line 46
+// column 6)" on the first "Check now" attempt, unreproducible on five
+// immediate retries of the exact same action. Every command this protocol
+// sends (dir listing at a given offset, read at a given fid/addr/size,
+// write of the same known bytes, ...) is safe to simply resend verbatim on
+// a corrupted/unparseable reply -- so _sendJson() does that automatically,
+// same as what the user already did by hand.
+const MAX_JSON_PARSE_RETRIES = 2;
 const WRITE_CHUNK_SIZE = 128; // Bytes pro SysEx-Write-Paket (vor 7->8 Packing)
 const READ_CHUNK_SIZE = 1024; // Bytes pro SysEx-Read-Anfrage
 
@@ -378,9 +391,28 @@ class DelugeSysex {
 
   /**
    * Sendet ein JSON-Kommando (optional mit binärem Payload für "write")
-   * und wartet auf die passende Antwort.
+   * und wartet auf die passende Antwort -- bei einer kaputten/unparsbaren
+   * Antwort (siehe MAX_JSON_PARSE_RETRIES's eigener Kommentar) wird dasselbe
+   * Kommando automatisch bis zu MAX_JSON_PARSE_RETRIES-mal unverändert erneut
+   * gesendet, bevor der Fehler tatsächlich nach oben durchgereicht wird.
    */
   async _sendJson(cmd, binaryPayload) {
+    let lastErr;
+    for (let attempt = 0; attempt <= MAX_JSON_PARSE_RETRIES; attempt++) {
+      try {
+        return await this._sendJsonAttempt(cmd, binaryPayload);
+      } catch (err) {
+        // Only a malformed/unparseable reply is worth retrying -- a real
+        // timeout means the device isn't responding at all, and resending
+        // immediately would just wait out the same timeout again.
+        if (!(err instanceof SyntaxError) || attempt === MAX_JSON_PARSE_RETRIES) throw err;
+        lastErr = err;
+      }
+    }
+    throw lastErr;
+  }
+
+  async _sendJsonAttempt(cmd, binaryPayload) {
     const session = await this._ensureSession();
     const msgId = this._buildMsgId(session);
     this._incrementCounter(session);

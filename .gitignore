@@ -3,9 +3,9 @@
 # that lives alongside it but isn't part of the app itself -- see tests/
 # own package.json (it's a separate, dependency-having project on purpose).
 
-# The entire dev/QA project: Playwright config, spec files, node_modules,
-# generated reports, screenshots. Keeps the synced/shared app free of
-# multi-hundred-MB node_modules and disposable test artifacts.
+# The entire dev/QA project stays out of the (public) repo entirely: spec
+# files, fixtures (some of which are real device/preset dumps not meant for
+# public redistribution), node_modules, generated reports, screenshots.
 tests/
 
 # OS/editor junk that shows up everywhere, not just in tests/.
