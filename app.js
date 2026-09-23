@@ -147,6 +147,44 @@ function dvPan(v) {
   const f = decodeQ31(v);
   return f === null ? null : Math.round(f * 25);
 }
+// A small number of params use a DIFFERENT raw<->display conversion than
+// every other 0-50 knob: oscillator pulse width and the (not yet exposed
+// in this app) audio-compressor attack/release/threshold/ratio params
+// (firmware: gui/menu_item/osc/pulse_width.h, audio_compressor/
+// compressor_params.h -- both override readCurrentValue()/getFinalValue()
+// with computeCurrentValueForHalfPrecisionMenuItem()/
+// computeFinalValueForHalfPrecisionMenuItem(), NOT the standard
+// computeCurrentValueForStandardMenuItem() every other unipolar param
+// uses). CONFIRMED, bit-exact, via a real device's own file-format
+// migration: resaving BOD01_06-Roygbass.XML in the newer format (same
+// sound, untouched by the user) changed oscAPulseWidth's raw from
+// 0x547AE138 to 0x51EB8500 -- and computeFinalValueForHalfPrecisionMenuItem
+// (the firmware's OWN menu-value-to-raw formula, reimplemented below as the
+// inverse check) applied to 33 gives EXACTLY 0x547AE138, zero rounding
+// error, while applied to 32 gives 0x51EB8510 (16 off, negligible) -- i.e.
+// the real device internally treats that original raw as displaying "33",
+// shifts to "32" purely from the resave's own rounding, and never touches
+// "41" (what dv()'s standard formula reads it as) at any point. An earlier,
+// less conclusive real-hardware test (cross-checked only via MIDI CC, which
+// follows the STANDARD 0-50<->0-127 scale regardless of which formula
+// governs the underlying raw value, so it couldn't actually discriminate
+// between the two hypotheses) had briefly pointed the other way and led to
+// a wrong revert to dv()/rawPct() for this field -- superseded by this
+// exact-match evidence. "Half precision" means the raw value only ever
+// uses the POSITIVE half of the full signed 32-bit range to represent the
+// full 0-50 display scale (firmware's own pulse_width.h comment: "osc pulse
+// width ... aren't set up for negative inputs") -- using dv()'s FULL-range
+// assumption on that half-range value reads it as roughly 8-10 units higher
+// than what the device itself shows.
+function dvHalfPrecision(v) {
+  const n = signed32(v);
+  if (n === null) return null;
+  return Math.floor((n * 100 + 2147483648) / 4294967296);
+}
+function pctHalfPrecision(v) {
+  const d = dvHalfPrecision(v);
+  return d === null ? null : Math.round((d / 50) * 100);
+}
 // Deluge-displayed modulation depth for a patch cable: -50.00 to +50.00.
 // PatchCableStrength is a Decimal menu item with an internal range of
 // -5000..+5000 (kMin/MaxMenuPatchCableValue) but getNumDecimalPlaces()==2,
@@ -192,7 +230,19 @@ const INIT = {
   mode: 'subtractive',
   oscAVolume: '0x7FFFFFFF',
   oscBVolume: '0x80000000',
+  oscAPulseWidth: '0x00000000',
+  oscBPulseWidth: '0x00000000',
   noiseVolume: '0x80000000',
+  // The overall voice's own output level (DEST_SHORTCUT calls its shortcut
+  // pad "LEVEL") -- distinct from oscAVolume/oscBVolume (the two
+  // oscillators' own MIX balance). Found completely uncovered anywhere in
+  // this app via a direct diff against a real target/actual pair
+  // (BOD01_06-Roygbass.XML vs. the rebuilt Patchbook.XML): the real target
+  // wanted this at roughly 19% of range, the rebuild was still sitting at
+  // this exact init default (~60%) because nothing ever asked for it to be
+  // touched -- about as large and audible a gain-staging gap as this guide
+  // could have, and it went completely unmentioned.
+  volume: '0x4CCCCCA8',
   pan: '0x00000000',
   lpfFrequency: '0x7FFFFFFF',
   lpfResonance: '0x80000000',
@@ -206,8 +256,11 @@ const INIT = {
   lfo1Rate: '0x1999997E',
   lfo2Rate: '0x00000000',
   modFXType: 'none',
+  modFXOffset: '0x00000000',
+  modFXFeedback: '0x00000000',
   delayRate: '0x00000000',
   delayFeedback: '0x80000000',
+  delaySyncLevel: '7',
   reverbAmount: '0x80000000',
   arpMode: 'off',
   modulatorAmount: '0x80000000',
@@ -223,15 +276,25 @@ const INIT = {
 
 // The init patch itself already ships 3 baked-in modulation routings, so
 // every untouched preset carries them too -- they shouldn't be presented as
-// a deliberate custom choice unless their depth was actually changed.
+// a deliberate custom choice unless their depth OR polarity was actually
+// changed. Polarity added after real-hardware testing confirmed a real,
+// audible bug: velocity->volume's own AMOUNT matching init made
+// cableIsDefault() skip it entirely -- no step, no check field at all --
+// even though its POLARITY (bipolar vs unipolar, see cableHasPolarity()'s
+// own comment) genuinely differed from the target. A cable's amount
+// matching its init default no longer means "nothing to check here" if
+// its polarity doesn't also match.
 const INIT_CABLES = [
-  { source: 'velocity', destination: 'volume', amount: '0x3FFFFFE8' },
-  { source: 'aftertouch', destination: 'volume', amount: '0x2A3D7094' },
-  { source: 'y', destination: 'lpfFrequency', amount: '0x19999990' },
+  { source: 'velocity', destination: 'volume', amount: '0x3FFFFFE8', polarity: 'unipolar' },
+  { source: 'aftertouch', destination: 'volume', amount: '0x2A3D7094', polarity: 'unipolar' },
+  { source: 'y', destination: 'lpfFrequency', amount: '0x19999990', polarity: 'bipolar' },
 ];
 function cableIsDefault(c) {
   const ref = INIT_CABLES.find(d => d.source === c.source && d.destination === c.destination);
-  return !!ref && !q31Differs(c.amount, ref.amount, 5);
+  if (!ref) return false;
+  if (q31Differs(c.amount, ref.amount, 5)) return false;
+  if (cableHasPolarity(c.source) && c.polarity && c.polarity !== ref.polarity) return false;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -448,10 +511,139 @@ function humanize(name) {
     .replace(/([0-9])([A-Z])/g, '$1 $2');
   return s.replace(/\b\w/g, c => c.toUpperCase()).trim();
 }
+// A handful of destinations use one raw XML name for patch-cable routing
+// purposes but a DIFFERENT name for the same parameter's own displayed
+// concept -- confirmed real, not a naming-drift artifact: oscAPhaseWidth/
+// oscBPhaseWidth is genuinely the firmware's own patch-cable-destination
+// name for what the UI (and every base-value attribute, oscAPulseWidth) it
+// otherwise always calls "pulse width" -- humanize()'s generic camelCase
+// splitter has no way to know that, so it rendered "Phase Width" wherever a
+// cable targets this destination (mod matrix column/step title/tooltips),
+// reading as a different, wrong parameter next to the correct "pulse width"
+// wording everywhere else that same knob is mentioned.
+const DEST_DISPLAY_OVERRIDE = { oscAPhaseWidth: 'OSC1 Pulse Width', oscBPhaseWidth: 'OSC2 Pulse Width' };
+function destDisplayName(destination) { return DEST_DISPLAY_OVERRIDE[destination] || humanize(destination); }
+
+// A patch cable's own polarity (bipolar vs unipolar) -- confirmed real,
+// switchable, and AUDIBLE via real-hardware testing, but previously
+// completely untracked anywhere in this app. Firmware source
+// (modulation/patch/patch_cable.cpp, PatchCable::hasPolarity()): X and Y
+// (MPE expression) can't have their polarity changed at all, so they're
+// the only sources this is never worth mentioning for; every other source
+// (velocity, aftertouch, envelope1/2, lfo1/2, random, note, sidechain/
+// compressor) supports it. getDefaultPolarity() shows WHY this can't be
+// treated like every other "is this at its own default" field: aftertouch/
+// Y/X/sidechain each have a fixed, hardcoded default, but every other
+// source's default is `FlashStorage::defaultPatchCablePolarity` -- a
+// GLOBAL, per-DEVICE preference that isn't stored in the preset file at
+// all and this app has no way to know. So polarity is always shown/
+// checked explicitly here rather than only when "changed from default",
+// unlike every other cable property.
+const POLARITY_FIXED_SOURCES = new Set(['x', 'y']);
+function cableHasPolarity(source) { return !POLARITY_FIXED_SOURCES.has(source); }
+// A cable's own <polarity> tag is OPTIONAL in the XML -- omitted on every
+// preset that predates this attribute existing (and, per patch_cable_set.cpp,
+// on every cable a still-current save never had reason to touch it on).
+// readPatchCablesFromFile() confirms the firmware itself does NOT leave this
+// ambiguous when the tag is missing: it starts each cable at a hardcoded
+// `Polarity polarity = Polarity::BIPOLAR;` local (not the per-device
+// FlashStorage default, which only applies when a cable is freshly created
+// via the grid UI, never when a file is read), then overrides it to UNIPOLAR
+// only for source==AFTERTOUCH, then overrides it again only if the file
+// actually has an explicit <polarity> tag. So an omitted tag has one exact,
+// known resulting value -- not an unknowable one -- and this app can and
+// should fill it in the same way, rather than silently hiding the whole
+// bipolar/unipolar step for every cable a file happens to predate the tag on
+// (confirmed real: BOD01_06-Roygbass.XML, an older-format preset, omits
+// <polarity> on every one of its cables).
+function cableDefaultPolarity(source) { return source === 'aftertouch' ? 'unipolar' : 'bipolar'; }
 function cablesOf(patch) {
   const cablesRaw = get(patch.defaultParams || {}, 'patchCables.patchCable', []) || [];
-  const cables = Array.isArray(cablesRaw) ? cablesRaw : [cablesRaw];
-  return cables.filter(c => c.source && c.destination);
+  const cablesList = Array.isArray(cablesRaw) ? cablesRaw : [cablesRaw];
+  // A cable's own depth can itself be modulated by a second source (real,
+  // documented Deluge feature -- e.g. LFO1 -> pitch, whose *depth* is in
+  // turn modulated by LFO1 again, a "double mod"). Two different XML
+  // encodings exist for this, both confirmed against the firmware source
+  // (modulation/patch/patch_cable_set.cpp):
+  //  - Current (firmware >=3.2.0): nested <patchCable ...><depthControlledBy>
+  //    <patchCable source="..." amount="..." /></depthControlledBy>
+  //    </patchCable> -- no destination on the inner one, since it's
+  //    modulating a depth, not a parameter.
+  //  - Legacy (an older preset that's never been resaved since): a flat,
+  //    separate top-level <patchCable source="X" destination="range"
+  //    amount="Y" />, whose real target is resolved via a GLOBAL,
+  //    file-order-INDEPENDENT rule -- confirmed via param.cpp's
+  //    fileStringToParamConst(), which special-cases the literal string
+  //    "range" to PLACEHOLDER_RANGE "for compatibility reading files from
+  //    before V3.2.0", and patch_cable_set.cpp's readPatchCablesFromFile():
+  //    it first reads EVERY cable in the file, tracking whichever one most
+  //    recently (anywhere in the file, "back when only one range adjustable
+  //    cable was allowed") carried rangeAdjustable="1"/<rangeAdjustable>1
+  //    </rangeAdjustable> -- then, only in a SEPARATE PASS AFTER the whole
+  //    file has been read, retroactively points every PLACEHOLDER_RANGE
+  //    cable at that one target. A "range" cable can therefore appear
+  //    BEFORE its own rangeAdjustable-marked target in the file, as it
+  //    does on a real device preset (Bod01_06-Roygbass.XML: the lfo1->range
+  //    cable is 4 entries before the lfo1->pitch rangeAdjustable="1" one) --
+  //    an earlier, single-pass version of this resolver required the
+  //    marker to come first and silently missed it there, still showing a
+  //    nonsense flat "Patch: LFO1 -> Range" step/matrix-column.
+  // A cable's depth can be modulated by MORE THAN ONE second source at
+  // once -- confirmed on real presets (e.g. BOC01/BOD01_49-From the
+  // distance.XML: LFO1 -> pitch's own vibrato depth is modulated by BOTH
+  // lfo1 AND random simultaneously, two separate destination="range"
+  // cables retroactively resolved to the same single rangeAdjustable
+  // target) and by the firmware's own write path (patch_cable_set.cpp's
+  // writePatchCablesToFile() loops over EVERY cable matching the same
+  // destinationParamDescriptor when writing <depthControlledBy>, not just
+  // the first one it finds). Never carried as a single `depthModulator` --
+  // that silently collapsed a real two-source case down to just the last
+  // one seen (a Map keyed by target, overwritten on each match). Carried
+  // as `depthModulators: [{source, amount}, ...]` instead, so
+  // buildModMatrixTable()'s extra column(s), buildGuide()'s
+  // depthModStep()(s), and buildSignalPathSvg()'s loop/arrow(s) can all
+  // show every one of them, not just one.
+  let rangeAdjustableTarget = null; // "source\0destination" of the LAST rangeAdjustable cable anywhere in the file
+  for (const c of cablesList) {
+    if (c.source && c.destination && c.destination !== 'range' && c.rangeAdjustable && c.rangeAdjustable !== '0') {
+      rangeAdjustableTarget = `${c.source}\u0000${c.destination}`;
+    }
+  }
+  const legacyDepthsByTarget = new Map(); // target key -> [{source, amount, polarity}, ...]
+  if (rangeAdjustableTarget) {
+    for (const c of cablesList) {
+      if (c.source && c.destination === 'range') {
+        if (!legacyDepthsByTarget.has(rangeAdjustableTarget)) legacyDepthsByTarget.set(rangeAdjustableTarget, []);
+        legacyDepthsByTarget.get(rangeAdjustableTarget).push({ source: c.source, amount: c.amount, polarity: c.polarity });
+      }
+    }
+  }
+  return cablesList.filter(c => c.source && c.destination && c.destination !== 'range').map(c => {
+    // Same "same tag name always normalizes to an array, even a lone one"
+    // rule this parser applies to patchCables.patchCable itself applies
+    // here too, since the inner element is *also* named <patchCable> --
+    // found via a real preset where this stayed a single-element array
+    // rather than a plain object, silently defeating a first version of
+    // this check that assumed the latter.
+    const innerRaw = c.depthControlledBy && c.depthControlledBy.patchCable;
+    const innerList = innerRaw ? (Array.isArray(innerRaw) ? innerRaw : [innerRaw]) : [];
+    const modernDepths = innerList.filter(i => i && i.source).map(i => ({ source: i.source, amount: i.amount, polarity: i.polarity }));
+    const rawDepthModulators = modernDepths.length ? modernDepths : (legacyDepthsByTarget.get(`${c.source}\u0000${c.destination}`) || []);
+    // A chained depth modulator is its OWN cable (firmware: patch_cable_set.cpp
+    // reads/writes a <polarity> tag on the inner <patchCable> exactly like any
+    // other), with its own polarity independent of the outer connection's --
+    // backfilled the same way and for the same reason as the outer cable's own
+    // polarity (see cableDefaultPolarity()'s comment): real hardware report,
+    // "dial in amount AND Bi/Uni" for this exact nested modulator.
+    const depthModulators = rawDepthModulators.map(m => ({ ...m, polarity: m.polarity || cableDefaultPolarity(m.source) }));
+    // depthModulator/depthModulatedBy (singular) kept only as a
+    // convenience alias for the FIRST modulator -- every real consumer
+    // should iterate depthModulators instead.
+    const polarity = c.polarity || cableDefaultPolarity(c.source);
+    return depthModulators.length
+      ? { ...c, polarity, depthModulators, depthModulator: depthModulators[0], depthModulatedBy: depthModulators[0].source }
+      : { ...c, polarity };
+  });
 }
 
 // The Deluge has no dedicated per-parameter knobs beyond two contextual gold
@@ -488,6 +680,51 @@ function midiNoteName(n) {
   const name = NOTE_NAMES[((n % 12) + 12) % 12];
   const octave = Math.floor(n / 12) - 2;
   return `${name}${octave}`;
+}
+
+// A "sync level" (LFO1/LFO2/Delay/Sidechain tempo sync) is NOT a continuous
+// numeric value -- it's a fixed list the Deluge's own SYNC menu scrolls
+// through. Showing the raw stored integer alone (e.g. "sync level 6") told
+// the user nothing about which menu option to actually select (reported
+// directly: "delay sync ist kein int value, sondern eine liste").
+//
+// The NAME shown for a given raw value is NOT fixed across devices/songs --
+// confirmed against firmware source: model/song.h's getInputTickMagnitude()
+// = insideWorldTickMagnitude + a per-song BPM-derived offset, and
+// model/song.cpp's own file-reading code
+// (`insideWorldTickMagnitude = reader.readTagOrAttributeValueInt();`)
+// shows this value is read from EACH SONG FILE itself, not a fixed global
+// -- a standalone preset file never carries it (model/sync.h's own
+// comment: "these names are correct only for default resolution"). The
+// manual documents the note-name list assuming the bare FACTORY default
+// (FlashStorage::defaultMagnitude = 2): "Options 2 bar, 1 bar, 2nd, 4th,
+// 8th, 16th, 32nd, 64th, 128th" -- this table originally used that list
+// directly, but TWO separate real-hardware reports ("32nd on deluge is 64
+// on app", then "shows 2bar on device, but one bar on app") both landed
+// exactly one step off from it, in the same direction every time. Both are
+// bit-exact matches for tickMagnitude=1 instead of the factory default 2
+// (verified by directly reimplementing model/sync.cpp's
+// getNoteMagnitudeFfromNoteLength()/getNoteLengthNameFromMagnitude() and
+// sweeping every level at both tickMagnitude values) -- so this table uses
+// that resolution instead, since it's now the twice-confirmed real match
+// rather than a theoretical default. A "show the raw click-count instead"
+// attempt at hedging this turned out useless in practice either way --
+// reported directly ("i dont see the int value on the hardware"): the
+// Deluge's own SYNC menu only ever displays the NAME, never the number, so
+// a step that can't be visually cross-checked against the real screen is
+// worse than one that's usually right. Still not a universal guarantee --
+// a device/song whose OWN resolution differs from what both real reports
+// so far agreed on can still read one step off -- so the ambiguity is
+// still explained via the LFO/delay/sidechain concept's "why" text.
+const SYNC_LEVEL_NAMES = ['OFF', '4-Bar', '2-Bar', '1-Bar', '2nd', '4th', '8th', '16th', '32nd', '64th'];
+function syncLevelName(raw) {
+  const n = parseInt(raw, 10);
+  if (Number.isNaN(n) || n < 0) return String(raw);
+  if (n === 0) return 'OFF';
+  if (n <= 9) return SYNC_LEVEL_NAMES[n];
+  if (n <= 18) return `${SYNC_LEVEL_NAMES[n - 9]} (triplets)`;
+  if (n <= 27) return `${SYNC_LEVEL_NAMES[n - 18]} (dotted)`;
+  return String(raw);
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +775,9 @@ const PARAM_CONCEPTS = {
   'osc.type': { why: 'The waveform is the raw timbre before anything else touches it -- a square is hollow/reedy, a saw is bright/buzzy, a triangle is soft/flute-like. Everything else in this guide (filter, envelope, effects) shapes this starting point.', tryThis: 'Cycle through the other waveform options on the same oscillator and listen to how differently the filter and envelope steps below end up shaping each one.' },
   'osc.sample': { why: 'A sample replaces the synthesized waveform with a recorded one, so the "oscillator" step becomes about picking source material rather than a shape -- everything downstream (filter, envelope, effects) still applies on top of it exactly the same way.' },
   'osc.transpose': { why: 'Transpose shifts this oscillator’s pitch in semitones independent of the note played -- used to stack an oscillator an octave up/down or a fifth apart from the other one for a fuller or more harmonic tone.' },
+  'osc.pulseWidth': { why: 'Pulse width reshapes the waveform itself, not just its pitch or level -- pushed away from center it gets thinner and more nasal (further from a full, fat square wave), which is also exactly what a patch cable modulating it in real time (classic PWM) sweeps through continuously.' },
+  'osc.retrigPhase': { why: 'Left off, each new note continues the waveform from wherever its cycle happens to be (free-running) -- turned on, every note-on snaps the oscillator back to a fixed point in its cycle first, so notes attack more consistently (useful for punchy/plucky sounds) instead of subtly varying note to note.' },
+  'mixer.level': { why: 'This is the voice’s own overall output level -- set independently of the OSC1/OSC2 balance below it, and easy to overlook since nothing else in the signal chain depends on it being touched. Left at its own default here, this preset would sit noticeably louder or quieter than intended.' },
   'mixer.balance': { why: 'Blending OSC1 and OSC2 is how two different waveforms combine into one composite tone -- equal levels give an even blend, a big gap means one oscillator is really just coloring the other.', tryThis: 'Solo OSC1 by turning OSC2 all the way down, listen, then bring OSC2 back up gradually to hear exactly what it’s adding.' },
   'mixer.noise': { why: 'A dash of noise adds breath/air/grit on top of the tuned oscillators -- useful for percussive attacks (a drum "chiff") or airy pads, without it being a pitched part of the sound.' },
   'mixer.pan': { why: 'Pan places the sound in the stereo field. On its own it just moves the source left/right, but it matters a lot once several patches share a mix -- spreading similar sounds apart in pan keeps a track from turning into mono mud.' },
@@ -548,14 +788,14 @@ const PARAM_CONCEPTS = {
   'filter.route': { why: 'When both filters are active, routing decides whether the signal passes through them one after another (series -- each filter’s output feeds the next, so their effects compound) or side-by-side with the results mixed back together (parallel -- each filter hears the same unfiltered signal, so neither one’s output passes through the other).' },
   'envelope.amp': { why: 'Envelope 1 shapes loudness over time (Attack/Decay/Sustain/Release) -- a fast attack is percussive/plucky, a slow attack is a swell/pad; a short release stops dead on note-off, a long one keeps ringing after you let go.', tryThis: 'Push attack all the way up on a patch that’s normally percussive -- the same waveform and filter suddenly feel like a completely different, more atmospheric patch.' },
   'envelope.filter': { why: 'Envelope 2 defaults to shaping the filter cutoff over time rather than loudness -- this is what gives a "wah"/pluck-like movement to the tone itself (bright at the start, darkening as the note continues, or the reverse), independent of the amp envelope.' },
-  'lfo': { why: 'An LFO is a slow, repeating wave used as a *modulation source* rather than heard directly -- it continuously nudges whatever it’s routed to (pitch = vibrato, cutoff = filter wobble, volume = tremolo) at the rate you set.', tryThis: 'Slow the rate right down until you can count the individual cycles -- that’s exactly what’s happening much faster at a normal "wobble" rate, just easier to hear happening.' },
+  'lfo': { why: 'An LFO is a slow, repeating wave used as a *modulation source* rather than heard directly -- it continuously nudges whatever it’s routed to (pitch = vibrato, cutoff = filter wobble, volume = tremolo) at the rate you set. If a SYNC step is shown, note its named option (e.g. "32nd") is only a best guess at your device\'s factory-default SONG > DEFAULT RESOLUTION setting -- if that\'s been changed, the real menu may show a name one step off from what\'s listed here.', tryThis: 'Slow the rate right down until you can count the individual cycles -- that’s exactly what’s happening much faster at a normal "wobble" rate, just easier to hear happening.' },
   'vibrato': { why: 'Vibrato is LFO1 modulating pitch specifically -- common enough that it gets its own dedicated shortcut pad instead of the generic two-step "pick destination, pick source" patching procedure used for every other routing.' },
   'modmatrix': { why: 'A patch cable is a modulation routing: some source (an envelope, LFO, velocity, aftertouch...) continuously controls some destination parameter’s value in real time, on top of whatever that parameter is manually set to -- this is what makes a patch feel alive/responsive rather than static.' },
   'arpeggiator': { why: 'The arpeggiator automatically steps through the notes of whatever chord you hold, one at a time, at a set rate -- turns a single held chord into a moving, rhythmic pattern without you having to play it.' },
   'modfx': { why: 'Mod FX (chorus/flanger/phaser) all work by mixing a signal with a very slightly delayed, modulated copy of itself -- chorus thickens/widens, flanger sweeps a metallic comb-filter sound, phaser sweeps notches instead of peaks. Same underlying trick, different flavor of delay/feedback.' },
-  'delay': { why: 'Delay repeats the sound after a gap, each repeat quieter (feedback controls how many repeats you hear/how slowly they decay) -- ping-pong bounces each repeat between left/right instead of straight back on both sides.' },
+  'delay': { why: 'Delay repeats the sound after a gap, each repeat quieter (feedback controls how many repeats you hear/how slowly they decay) -- ping-pong bounces each repeat between left/right instead of straight back on both sides. If a SYNC step is shown, note its named option (e.g. "32nd") is only a best guess at your device\'s factory-default SONG > DEFAULT RESOLUTION setting -- if that\'s been changed, the real menu may show a name one step off from what\'s listed here.' },
   'reverb': { why: 'Reverb simulates the sound reflecting around a physical space -- it’s what separates a "dry"/close-up sound from one that feels like it’s playing in a room or hall.' },
-  'sidechain': { why: 'A sidechain compressor ducks (temporarily quiets) this sound every time it receives a trigger -- the classic use is ducking a bass/pad under every kick drum hit so the kick always cuts through, without you having to automate volume by hand.' },
+  'sidechain': { why: 'A sidechain compressor ducks (temporarily quiets) this sound every time it receives a trigger -- the classic use is ducking a bass/pad under every kick drum hit so the kick always cuts through, without you having to automate volume by hand. If a SYNC step is shown, note its named option (e.g. "32nd") is only a best guess at your device\'s factory-default SONG > DEFAULT RESOLUTION setting -- if that\'s been changed, the real menu may show a name one step off from what\'s listed here.' },
   'distortion': { why: 'Saturation, bitcrush and sample-rate reduction (decimation) are three different flavors of "make it dirtier": saturation rounds off peaks (warm/analog-ish), bitcrush reduces bit depth (harsh, stair-stepped digital grit), decimation reduces the effective sample rate (aliased, lo-fi/glitchy).' },
   'eq': { why: 'This EQ is a simple 2-band bass/treble tone control -- a much coarser tool than the LPF/HPF, useful for a quick tonal nudge rather than the LPF/HPF’s dramatic sweeping effect.' },
   'wavefold': { why: 'A wavefolder reflects ("folds") a signal back on itself once it crosses a threshold instead of clipping it flat -- produces a harmonically rich, often metallic character that’s different from ordinary clipping distortion, and gets more extreme as you push the input hotter.' },
@@ -656,7 +896,7 @@ function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 // rather than throwing or silently reusing the old generic line.
 function cableWhyText(source, destination, amount) {
   const srcLabelText = SOURCE_LABEL[source] || humanize(source);
-  const destLabelText = humanize(destination);
+  const destLabelText = destDisplayName(destination);
   const behavior = SOURCE_BEHAVIOR[source] || `${srcLabelText}’s value`;
   const effect = DEST_EFFECT[destination];
   const goesUp = !(typeof amount === 'number' && amount < 0);
@@ -694,6 +934,12 @@ function makeStep(title, beginnerHtml, expertHtml, checkFields, extra) {
     manualRef: extra.manualRef || null,
     conceptKey: extra.conceptKey || null,
     why: extra.why || null,
+    // Rendered indented, directly under the step right before it (see
+    // renderGuide()) -- for a step that only makes sense as a follow-on to
+    // the one before it (e.g. depthModStep()'s chained-depth step depends
+    // on its parent cable already being connected), so that dependency
+    // reads visually instead of the two looking like independent peers.
+    indent: !!extra.indent,
   };
 }
 function cf(path, label) { return { path, label }; }
@@ -740,6 +986,36 @@ function folderOf(fileName) {
   const i = fileName.lastIndexOf('/');
   return stripSamplesRoot(i === -1 ? fileName : fileName.slice(0, i));
 }
+// Pulse width is a base per-oscillator parameter, not tied to sample/
+// waveform-picking at all -- separate from describeOsc() (which returns a
+// single step or null) since a patch can change both the waveform AND the
+// pulse width independently, and should get two focused steps rather than
+// one crowded one. Previously not covered anywhere at all (found via
+// real-hardware testing against a preset that moves it) -- DEST_SHORTCUT/
+// DEST_EFFECT already had entries for it (used when a patch cable targets
+// it), just never as its own base-value step.
+// NOTE: this base-value attribute really is oscAPulseWidth/oscBPulseWidth,
+// always -- an earlier version of this comment called it "a.k.a. phase
+// width", which was wrong. "oscAPhaseWidth"/"oscBPhaseWidth" is a DIFFERENT
+// raw name the firmware genuinely also uses, but only as a patch-cable
+// DESTINATION for this exact same knob (see DEST_DISPLAY_OVERRIDE's own
+// comment) -- never as the base-value attribute itself.
+function describePulseWidth(dp, label, oscNum) {
+  const key = oscNum === 1 ? 'oscAPulseWidth' : 'oscBPulseWidth';
+  const path = `defaultParams.${key}`;
+  const value = dp[key];
+  if (!value || !q31Differs(value, INIT[key])) return null;
+  const shortcut = DEST_SHORTCUT[oscNum === 1 ? 'oscAPhaseWidth' : 'oscBPhaseWidth']; // e.g. "OSC1 PW"
+  // dvHalfPrecision()/pctHalfPrecision(), NOT dv()/rawPct() -- see their
+  // own comment: pulse width uses a different raw<->display conversion
+  // than every other 0-50 knob, confirmed bit-exact against real hardware.
+  return makeStep(`${label}: pulse width`,
+    `${ck(path, `${shift(shortcut)} to ${val(dvHalfPrecision(value))}`)}.`,
+    `${ck(path, `Pulse width ${val(pctHalfPrecision(value) + '%')}`)}.`,
+    [cf(path, 'Pulse width')],
+    { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Oscillator column)', 88), conceptKey: 'osc.pulseWidth' });
+}
+
 function describeOsc(osc, label, oscNum) {
   if (!osc) return null;
   const col = `OSC${oscNum}`;
@@ -791,13 +1067,49 @@ function describeOsc(osc, label, oscNum) {
     beginnerExtras.push(ck(`osc${oscNum}.transpose`, `${shift(`${col} TRANSPOSE`)} ${val(transpose + ' st')}`));
     expertExtras.push(ck(`osc${oscNum}.transpose`, `transpose ${val(transpose + ' st')}`));
   }
-  if (cents !== '0') expertExtras.push(`fine-tune ${val(cents + ' cents')}`);
+  // Was previously plain, un-wrapped text in the EXPERT line only (never
+  // shown in Beginner mode at all, and not individually check-colorable
+  // even in Expert) -- a real preset with a non-zero cents value (-9, a
+  // clearly audible fine-tune) checked out fully "green" here purely
+  // because nothing was ever actually comparing it, exactly the "sounds
+  // different despite all-green steps" class of report this was found
+  // from. Now shown in both modes and independently checkable, same
+  // treatment as transpose right above it.
+  if (cents !== '0') {
+    beginnerExtras.push(ck(`osc${oscNum}.cents`, `${shift(`${col} TRANSPOSE`)} fine-tune to ${val(cents + ' cents')}`));
+    expertExtras.push(ck(`osc${oscNum}.cents`, `fine-tune ${val(cents + ' cents')}`));
+  }
   if (osc.oscillatorSync === '1') { beginnerExtras.push(`${shift('OSC SYNC')} on`); expertExtras.push(`${val('oscillator sync ON')} (hard-syncs to the other oscillator)`); }
   return makeStep(`${label}: waveform`,
     `${ck(`osc${oscNum}.type`, `${shift(`${col} TYPE`)}, turn SELECT to ${val(type)}`)}.${beginnerExtras.length ? ' Then ' + beginnerExtras.join(', ') + '.' : ''}`,
     `Set ${label} to ${ck(`osc${oscNum}.type`, `a ${val(type)} wave`)}${expertExtras.length ? ', ' + expertExtras.join(', ') : ''}.`,
-    [cf(`osc${oscNum}.type`, 'Type'), cf(`osc${oscNum}.transpose`, 'Transpose')],
+    [cf(`osc${oscNum}.type`, 'Type'), cf(`osc${oscNum}.transpose`, 'Transpose'), cf(`osc${oscNum}.cents`, 'Cents')],
     { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Oscillator column)', 88), conceptKey: 'osc.type' });
+}
+
+// Real-hardware testing found the oscillator's phase-reset behavior
+// completely uncovered: manual §4.8 confirms a dedicated shortcut, RETRIG
+// PHASE ("Phase in degrees that the oscillator will be reset on note-on.
+// Also can be switched off."), under the same OSCILLATOR 1/2 grid column
+// as TRANSPOSE/PULSE WIDTH -- but raw retrigPhase="-1" (off) vs any other
+// value is a real, audible difference (fixed phase alignment on every
+// note vs. free-running) this guide never mentioned at all. Kept as its
+// own step (same reasoning as pulse width: an independent on/off setting,
+// not tied to waveform/transpose). The exact raw-value-to-degrees mapping
+// for a non-"-1" value isn't confirmed (the manual gives the concept, not
+// the encoding), so the instructional text only commits to "on vs off" and
+// shows the raw stored number, rather than inventing a specific ° figure.
+function describeRetrigPhase(osc, label, oscNum) {
+  if (!osc || osc.retrigPhase === undefined) return null;
+  const path = `osc${oscNum}.retrigPhase`;
+  const off = osc.retrigPhase === '-1';
+  if (off) return null; // "-1" is the off/free-running default -- nothing to build
+  const col = `OSC${oscNum}`;
+  return makeStep(`${label}: retrigger phase`,
+    `${ck(path, `${shift(`${col} RETRIG PHASE`)} on, at raw value ${val(osc.retrigPhase)} (0 = the very start of the waveform) instead of left off/free-running`)}.`,
+    `${ck(path, `Retrigger phase: on (raw ${val(osc.retrigPhase)})`)}.`,
+    [cf(path, 'Retrig phase')],
+    { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Oscillator column, Retrigger Phase)', 88), conceptKey: 'osc.retrigPhase' });
 }
 
 function buildGuide(patch) {
@@ -817,16 +1129,16 @@ function buildGuide(patch) {
       { manualRef: manualRef('§4.7 "Creating a New Synthesizer"', 93) }),
     patch.mode && patch.mode !== INIT.mode
       ? makeStep('Synth engine mode',
-          `${shift('SYNTH MODE')}, turn SELECT to ${val(patch.mode.toUpperCase())} before anything else &mdash; the FM/ring-mod engine changes what the oscillator controls do.`,
-          `This patch uses the ${val(patch.mode)} engine rather than subtractive.`,
-          null,
+          `${shift('SYNTH MODE')}, turn SELECT to ${ck('mode', val(patch.mode.toUpperCase()))} before anything else &mdash; the FM/ring-mod engine changes what the oscillator controls do.`,
+          `This patch uses the ${ck('mode', val(patch.mode))} engine rather than subtractive.`,
+          [cf('mode', 'Mode')],
           { manualRef: manualRef('"Selecting FM, Ring Mod or Subtractive Synthesizer"', 94), conceptKey: patch.mode === 'fm' ? 'fm' : undefined })
       : null,
     (patch.polyphonic && patch.polyphonic !== INIT.polyphonic)
       ? makeStep('Polyphony',
-          `${shift('POLYPHONY')}, turn SELECT to ${val(patch.polyphonic.toUpperCase())}.`,
-          `Polyphony: ${val(patch.polyphonic)}.`,
-          null,
+          `${shift('POLYPHONY')}, turn SELECT to ${ck('polyphonic', val(patch.polyphonic.toUpperCase()))}.`,
+          `Polyphony: ${ck('polyphonic', val(patch.polyphonic))}.`,
+          [cf('polyphonic', 'Polyphony')],
           { manualRef: manualRef('§4.11 "Deluge Voices" (Setting the Synth Polyphony)', 105) })
       : null,
   ]);
@@ -863,12 +1175,27 @@ function buildGuide(patch) {
     }
   } else {
     oscSteps.push(describeOsc(patch.osc1, 'Oscillator 1', 1));
+    oscSteps.push(describePulseWidth(dp, 'Oscillator 1', 1));
+    oscSteps.push(describeRetrigPhase(patch.osc1, 'Oscillator 1', 1));
     oscSteps.push(describeOsc(patch.osc2, 'Oscillator 2', 2));
+    oscSteps.push(describePulseWidth(dp, 'Oscillator 2', 2));
+    oscSteps.push(describeRetrigPhase(patch.osc2, 'Oscillator 2', 2));
   }
   push('Oscillators', oscSteps);
 
   // --- Mixer / levels -----------------------------------------------
   const mixSteps = [];
+  // The voice's own overall output level -- distinct from (and set
+  // independently of) the OSC1/OSC2 balance below. Previously uncovered
+  // anywhere in this app (see INIT.volume's own comment for how that gap
+  // was found) despite having its own dedicated shortcut pad.
+  if (dp.volume && q31Differs(dp.volume, INIT.volume)) {
+    mixSteps.push(makeStep('Level',
+      `${ck('defaultParams.volume', `${shift('LEVEL')} set to ${val(dv(dp.volume))}`)}.`,
+      `${ck('defaultParams.volume', `Overall level: ${val(rawPct(dp.volume) + '%')}`)}.`,
+      [cf('defaultParams.volume', 'Level')],
+      { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Level)', 88), conceptKey: 'mixer.level' }));
+  }
   if (dp.oscBVolume && q31Differs(dp.oscBVolume, INIT.oscBVolume)) {
     mixSteps.push(makeStep('Balance OSC1 / OSC2',
       `${ck('defaultParams.oscBVolume', `${shift('OSC2 LEVEL')} up to ${val(dv(dp.oscBVolume))}`)} (OSC1 stays near full via ${kbd('OSC1 LEVEL')}).`,
@@ -917,20 +1244,46 @@ function buildGuide(patch) {
 
   // --- Filter -------------------------------------------------------
   const filterSteps = [];
+  // Frequency/Resonance get their own step, split off from Mode: both are
+  // real MIDI-Follow-mappable params, but bundling lpfMode's enum into the
+  // same step's checkFields used to disqualify the *whole* step from ever
+  // going live (see isLiveStep()'s "one uncovered field disqualifies the
+  // whole step" rule) -- found via real-hardware testing reporting these
+  // as never showing live despite turning the actual FREQUENCY/RESONANCE
+  // knobs. Mode keeps its own inline display here (still individually
+  // check-colored via its own data-check-path span) but moves to a
+  // separate conditional step below so its file-check status doesn't
+  // silently stop being tracked.
   if (dp.lpfFrequency && (q31Differs(dp.lpfFrequency, INIT.lpfFrequency) || (dp.lpfResonance && q31Differs(dp.lpfResonance, INIT.lpfResonance)))) {
     const lpfMode = patch.lpfMode || INIT.lpfMode;
     filterSteps.push(makeStep('Low-pass filter',
-      `${ck('defaultParams.lpfFrequency', `${shift('FREQUENCY')} (under LPF) to ${val(dv(dp.lpfFrequency))}`)}${dp.lpfResonance ? `. ${ck('defaultParams.lpfResonance', `${shift('RESONANCE')} to ${val(dv(dp.lpfResonance))}`)}` : ''}${plainDiffers(lpfMode, INIT.lpfMode) ? `. ${ck('lpfMode', `${shift('DB/OCT')} to cycle the filter slope to ${val(lpfMode)}`)}` : ''}.`,
+      `${ck('defaultParams.lpfFrequency', `${shift('FREQUENCY')} (under LPF) to ${val(dv(dp.lpfFrequency))}`)}${dp.lpfResonance ? `. ${ck('defaultParams.lpfResonance', `${shift('RESONANCE')} to ${val(dv(dp.lpfResonance))}`)}` : ''}.`,
       `LPF (${ck('lpfMode', val(lpfMode))}) ${ck('defaultParams.lpfFrequency', `cutoff ${val(rawPct(dp.lpfFrequency) + '%')}`)}, ${ck('defaultParams.lpfResonance', `resonance ${val(dp.lpfResonance ? rawPct(dp.lpfResonance) + '%' : '0%')}`)}.`,
-      [cf('defaultParams.lpfFrequency', 'Freq'), cf('defaultParams.lpfResonance', 'Res'), cf('lpfMode', 'Mode')],
+      [cf('defaultParams.lpfFrequency', 'Freq'), cf('defaultParams.lpfResonance', 'Res')],
+      { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (LPF)', 89), conceptKey: 'filter.lpf' }));
+  }
+  const lpfModeNow = patch.lpfMode || INIT.lpfMode;
+  if (plainDiffers(lpfModeNow, INIT.lpfMode)) {
+    filterSteps.push(makeStep('Low-pass filter mode',
+      `${ck('lpfMode', `${shift('DB/OCT')} (under LPF) to cycle the filter slope to ${val(lpfModeNow)}`)}.`,
+      `LPF mode: ${ck('lpfMode', val(lpfModeNow))}.`,
+      [cf('lpfMode', 'Mode')],
       { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (LPF)', 89), conceptKey: 'filter.lpf' }));
   }
   if (dp.hpfFrequency && q31Differs(dp.hpfFrequency, INIT.hpfFrequency)) {
     const hpfMode = patch.hpfMode || INIT.hpfMode;
     filterSteps.push(makeStep('High-pass filter',
-      `${ck('defaultParams.hpfFrequency', `${shift('FREQUENCY')} (under HPF) to ${val(dv(dp.hpfFrequency))}`)}${dp.hpfResonance ? `. ${ck('defaultParams.hpfResonance', `${shift('RESONANCE')} to ${val(dv(dp.hpfResonance))}`)}` : ''}${plainDiffers(hpfMode, INIT.hpfMode) ? `. ${ck('hpfMode', `HPF type to ${val(hpfMode)} via the SOUND menu (${selectMenu('HPF &gt; MODE')}; no dedicated shortcut pad)`)}` : ''}.`,
-      `${ck('defaultParams.hpfFrequency', `HPF cutoff ${val(rawPct(dp.hpfFrequency) + '%')}`)}.`,
-      [cf('defaultParams.hpfFrequency', 'Freq'), cf('defaultParams.hpfResonance', 'Res'), cf('hpfMode', 'Mode')],
+      `${ck('defaultParams.hpfFrequency', `${shift('FREQUENCY')} (under HPF) to ${val(dv(dp.hpfFrequency))}`)}${dp.hpfResonance ? `. ${ck('defaultParams.hpfResonance', `${shift('RESONANCE')} to ${val(dv(dp.hpfResonance))}`)}` : ''}.`,
+      `HPF (${ck('hpfMode', val(hpfMode))}) ${ck('defaultParams.hpfFrequency', `cutoff ${val(rawPct(dp.hpfFrequency) + '%')}`)}.`,
+      [cf('defaultParams.hpfFrequency', 'Freq'), cf('defaultParams.hpfResonance', 'Res')],
+      { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (HPF)', 89), conceptKey: 'filter.hpf' }));
+  }
+  const hpfModeNow = patch.hpfMode || INIT.hpfMode;
+  if (plainDiffers(hpfModeNow, INIT.hpfMode)) {
+    filterSteps.push(makeStep('High-pass filter mode',
+      `${ck('hpfMode', `HPF type to ${val(hpfModeNow)} via the SOUND menu (${selectMenu('HPF &gt; MODE')}; no dedicated shortcut pad)`)}.`,
+      `HPF mode: ${ck('hpfMode', val(hpfModeNow))}.`,
+      [cf('hpfMode', 'Mode')],
       { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (HPF)', 89), conceptKey: 'filter.hpf' }));
   }
   if (patch.filterRoute && patch.filterRoute !== INIT.filterRoute) {
@@ -976,39 +1329,166 @@ function buildGuide(patch) {
     const routed = cables.some(c => c.source === key);
     const rateChanged = dp[rateKey] && q31Differs(dp[rateKey], INIT[rateKey] || '0x00000000');
     if (!lfo || (!routed && !rateChanged)) return;
+    // Rate gets its own step, split off from Shape/Sync: Rate is a real
+    // MIDI-Follow-mappable param, but Shape (an enum) and Sync (a list, see
+    // syncLevelName()'s own comment) are neither -- bundling all three into
+    // one step's checkFields used to disqualify the *whole* step from ever
+    // going live (isLiveStep()'s "one uncovered field disqualifies the
+    // whole step" rule), same class of bug as the earlier LPF/HPF Mode
+    // split. Reported directly against real hardware: "lfo rate also"
+    // [should be live].
     lfoSteps.push(makeStep(`LFO ${n}`,
-      `${ck(`lfo${n}.type`, `${shift(`LFO${n} SHAPE`)} to ${val(lfo.type || 'triangle')}`)}${dp[rateKey] ? `. ${ck(`defaultParams.lfo${n}Rate`, `${shift(`LFO${n} RATE`)} to ${val(dv(dp[rateKey]))}`)}` : ''}${lfo.syncLevel && lfo.syncLevel !== '0' ? `. ${ck(`lfo${n}.syncLevel`, `${shift(`LFO${n} SYNC`)} to sync level ${val(lfo.syncLevel)}`)}` : ''}.`,
-      `${ck(`lfo${n}.type`, `LFO${n}: ${val(lfo.type || 'triangle')} wave`)}${dp[rateKey] ? `, ${ck(`defaultParams.lfo${n}Rate`, `rate ${val(rawPct(dp[rateKey]) + '%')}`)}` : ''}${lfo.syncLevel && lfo.syncLevel !== '0' ? `, ${ck(`lfo${n}.syncLevel`, 'tempo-synced')}` : ''}.`,
+      `${ck(`lfo${n}.type`, `${shift(`LFO${n} SHAPE`)} to ${val(lfo.type || 'triangle')}`)}${lfo.syncLevel && lfo.syncLevel !== '0' ? `. ${ck(`lfo${n}.syncLevel`, `${shift(`LFO${n} SYNC`)} to ${val(syncLevelName(lfo.syncLevel))}`)}` : ''}.`,
+      `${ck(`lfo${n}.type`, `LFO${n}: ${val(lfo.type || 'triangle')} wave`)}${lfo.syncLevel && lfo.syncLevel !== '0' ? `, ${ck(`lfo${n}.syncLevel`, `synced to ${val(syncLevelName(lfo.syncLevel))}`)}` : ''}.`,
       // buildCheckSteps() only covers lfo1/lfo2 -- no check field for lfo3/lfo4.
       (n === 1 || n === 2)
-        ? [cf(`lfo${n}.type`, 'Shape'), cf(`defaultParams.lfo${n}Rate`, 'Rate'), cf(`lfo${n}.syncLevel`, 'Sync')]
+        ? [cf(`lfo${n}.type`, 'Shape'), cf(`lfo${n}.syncLevel`, 'Sync')]
         : null,
       { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (LFO ' + n + ')', 90), conceptKey: 'lfo' }));
+    if (rateChanged) {
+      lfoSteps.push(makeStep(`LFO ${n} rate`,
+        `${ck(`defaultParams.lfo${n}Rate`, `${shift(`LFO${n} RATE`)} to ${val(dv(dp[rateKey]))}`)}.`,
+        `${ck(`defaultParams.lfo${n}Rate`, `LFO${n} rate ${val(rawPct(dp[rateKey]) + '%')}`)}.`,
+        (n === 1 || n === 2) ? [cf(`defaultParams.lfo${n}Rate`, 'Rate')] : null,
+        { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (LFO ' + n + ')', 90), conceptKey: 'lfo' }));
+    }
   });
   push('LFOs', lfoSteps);
 
   // The init patch itself already ships 3 default routings (INIT_CABLES); skip
   // showing them as a "step" unless their depth was actually changed, same
   // treatment as every other section.
+  // A cable whose own depth is itself modulated by a second source (a real
+  // "double mod", see cablesOf()'s own comment) gets its own SEPARATE step
+  // here -- previously only a footnote sentence tacked onto the outer
+  // cable's step, which real usage found effectively invisible ("fehlt
+  // gänzlich", i.e. reads as entirely missing) next to Mod Matrix's own
+  // extra column and Signal Path's own loop arrow both giving it a genuine
+  // first-class, separately-noticeable spot. Its own checkbox also lets
+  // "I've set the main depth" and "I've set the chained depth" be ticked
+  // off independently, instead of one shared checkbox covering both.
+  // Real-hardware-confirmed gesture (not in the official manual, but
+  // verified directly on a device rather than guessed at): don't leave the
+  // connection's own depth menu after turning SELECT for its base depth --
+  // press SELECT a second time right there to open that SAME connection's
+  // own "modulate depth" menu. An earlier version of this text said the
+  // second source is picked by holding its shortcut pad (same gesture as
+  // the OUTER connection) -- corrected directly against real hardware: at
+  // THIS nested depth, there's no shortcut-pad step at all, it's entirely
+  // SELECT-encoder-driven -- turn SELECT to choose the source, press SELECT
+  // again to open its own depth screen, then turn SELECT there for its
+  // depth (and, like any other polarity-eligible source, press MIDI/CV
+  // while still in that screen to set ITS OWN bipolar/unipolar -- reported
+  // directly: "dial in amount AND Bi/Uni"). Not vibrato-specific --
+  // confirmed generic to any patched cable, since the firmware source's own
+  // PatchCableStrength/SourceSelection menu items handle a normal cable and
+  // a range-adjusting one through the identical UI, just gated on whether
+  // the destination is a plain param or another cable's depth.
+  // `modulator` is one specific entry of c.depthModulators -- a cable's
+  // depth can be modulated by MORE THAN ONE second source at once
+  // (confirmed on a real preset: BOC01/BOD01_49-From the distance.XML has
+  // LFO1's own vibrato depth modulated by BOTH lfo1 AND random
+  // simultaneously), so this generates one step PER modulator, called once
+  // per entry in c.depthModulators below -- never collapsed to just one.
+  // `depthAmountKey` includes the modulator's own source specifically
+  // (cableDepthField()'s key format matches) so two modulators on the same
+  // cable get two independently-checkable fields, not one shared key that
+  // only the last one written would win.
+  function depthModStep(parentTitle, c, modulator, disambiguate) {
+    const depthAmountKey = `cable:depth:${c.source}->${c.destination}:${modulator.source}`;
+    const depthSrcLabel = SOURCE_LABEL[modulator.source] || humanize(modulator.source);
+    const depthBeginnerAmt = fmtCable(modulator.amount);
+    const depthExpertAmt = pctOfCable(modulator.amount) + '%';
+    const title = disambiguate ? `${parentTitle}: chained depth modulation (${depthSrcLabel})` : `${parentTitle}: chained depth modulation`;
+    // This nested modulator is its own cable with its own polarity (see
+    // cablesOf()'s own comment) -- same eligibility rule and gesture as any
+    // other cable's polarity (cableHasPolarity()), just reached one menu
+    // level deeper.
+    const depthPolarityEligible = cableHasPolarity(modulator.source) && modulator.polarity;
+    const depthPolarityKey = `cable:depth:polarity:${c.source}->${c.destination}:${modulator.source}`;
+    const depthPolarityButton = modulator.polarity === 'unipolar' ? 'CV' : 'MIDI';
+    const depthPolarityNote = depthPolarityEligible
+      ? ` While still in that screen: press ${kbd(depthPolarityButton)} to set its polarity to ${ck(depthPolarityKey, val(modulator.polarity.toUpperCase()))}.`
+      : '';
+    const checkFields = depthPolarityEligible
+      ? [cf(depthAmountKey, 'Depth mod'), cf(depthPolarityKey, 'Depth mod polarity')]
+      : [cf(depthAmountKey, 'Depth mod')];
+    return makeStep(title,
+      `Right after setting that depth above -- don't back out of the menu: press SELECT once more to open this connection's own "modulate depth" menu, turn SELECT to choose ${val(depthSrcLabel)} as the second source, press SELECT again to open its own depth screen, then turn SELECT there to set its depth to ${ck(depthAmountKey, val(depthBeginnerAmt))} (range -50.00 to 50.00).${depthPolarityNote}`,
+      `${ck(depthAmountKey, `Depth-of-depth (${val(depthSrcLabel)}): ${val(depthExpertAmt)}`)}.${depthPolarityNote}`,
+      checkFields,
+      {
+        manualRef: manualRef('§6.1 "Modulation Routing Basics"', 124), conceptKey: 'modmatrix',
+        why: `A "double mod": ${depthSrcLabel} doesn't modulate ${destDisplayName(c.destination)} directly here -- it modulates how STRONG ${parentTitle}'s own connection is, moment to moment, on top of that connection's own base depth.`,
+        indent: true,
+      });
+  }
+  // One depthModStep() per entry in c.depthModulators, tagging each one's
+  // title with its source only when there's more than one (the common
+  // single-modulator case keeps the plainer, un-suffixed title).
+  function depthModSteps(parentTitle, c) {
+    if (!c.depthModulators) return [];
+    return c.depthModulators.map(m => depthModStep(parentTitle, c, m, c.depthModulators.length > 1));
+  }
   const cableSteps = cables
     .filter(c => c.source && c.destination && !cableIsDefault(c))
-    .map(c => {
+    .flatMap(c => {
       const srcLabel = SOURCE_LABEL[c.source] || humanize(c.source);
       const beginnerAmt = fmtCable(c.amount);
       const expertAmt = pctOfCable(c.amount) + '%';
       // Matches cableField()'s own key format exactly -- see deluge-check.js.
       const connectKey = `cable:connect:${c.source}->${c.destination}`;
       const amountKey = `cable:amount:${c.source}->${c.destination}`;
-      // LFO1 -> pitch has its own dedicated single-pad shortcut (VIBRATO) rather
-      // than the generic two-step dest+source patch procedure (manual sec 4.6).
+      // Brief pointer only -- depthModStep() above carries the full
+      // instruction, its own checkable field, and its own "why".
+      const depthNote = !c.depthModulators ? ''
+        : c.depthModulators.length > 1
+          ? ' (see the next steps: this connection’s own depth is itself further modulated by more than one source.)'
+          : ' (see the next step: this connection’s own depth is itself further modulated.)';
+      // Polarity (bipolar vs unipolar) -- real, switchable, confirmed
+      // audible via real-hardware testing, but with no reliable "is this
+      // at its own default" answer (see cableHasPolarity()'s own comment),
+      // so always stated explicitly rather than only mentioned when
+      // "changed". Real-hardware-confirmed gesture (firmware source,
+      // PatchCableStrength::buttonAction(): a hardcoded {MIDI: BIPOLAR,
+      // CV: UNIPOLAR} map): while still in this connection's own depth
+      // menu (the same one the depth turn/chained-depth-mod steps use),
+      // press the dedicated MIDI button for bipolar or the dedicated CV
+      // button for unipolar.
+      const polarityEligible = cableHasPolarity(c.source) && c.polarity;
+      const polarityKey = `cable:polarity:${c.source}->${c.destination}`;
+      const polarityButton = c.polarity === 'unipolar' ? 'CV' : 'MIDI';
+      const polarityNote = polarityEligible
+        ? ` While still in that depth menu: press ${kbd(polarityButton)} to set its polarity to ${ck(polarityKey, val(c.polarity.toUpperCase()))}.`
+        : '';
+      const checkFields = polarityEligible
+        ? [cf(connectKey, 'Connect'), cf(amountKey, 'Depth'), cf(polarityKey, 'Polarity')]
+        : [cf(connectKey, 'Connect'), cf(amountKey, 'Depth')];
+      // LFO1 -> pitch has its own dedicated single-pad shortcut (VIBRATO,
+      // manual §4.8: "Depth of modulation between LFO1 and pitch") for the
+      // plain single-source case. Real-hardware testing confirmed that
+      // shortcut does NOT expose the "press SELECT again to chain a second
+      // source" gesture depthModStep() below needs -- only the generic
+      // two-step destination+source patching path (MASTER TRANSPOSE, same
+      // mechanism as any other modulation destination) does, so a chained
+      // cable here uses that path instead, even though it's still the same
+      // underlying "pitch" parameter either way.
       if (c.source === 'lfo1' && c.destination === 'pitch') {
-        return makeStep('Vibrato (LFO1 → pitch)',
-          `${ck(connectKey, shift('VIBRATO'))} set ${ck(amountKey, `depth to ${val(beginnerAmt)}`)} (range -50.00 to 50.00).`,
-          `${ck(connectKey, 'Vibrato')} depth (LFO1 → pitch): ${ck(amountKey, val(expertAmt))}.`,
-          [cf(connectKey, 'Connect'), cf(amountKey, 'Depth')],
-          { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Vibrato)', 89), conceptKey: 'vibrato' });
+        const vibratoTitle = 'Vibrato (LFO1 → pitch)';
+        const vibratoStep = c.depthModulators
+          ? makeStep(vibratoTitle,
+              `${ck(connectKey, `${shift(DEST_SHORTCUT.pitch)} to select the destination, then ${shift(srcLabel)} (in the modulation section) to connect it`)}. Turn SELECT to set ${ck(amountKey, `depth to ${val(beginnerAmt)}`)} (range -50.00 to 50.00).${polarityNote}${depthNote}`,
+              `${ck(connectKey, 'Vibrato')} depth (LFO1 → pitch): ${ck(amountKey, val(expertAmt))}.${polarityNote}${depthNote}`,
+              checkFields,
+              { manualRef: manualRef('§6.1 "Modulation Routing Basics"', 124), conceptKey: 'vibrato' })
+          : makeStep(vibratoTitle,
+              `${ck(connectKey, shift('VIBRATO'))} set ${ck(amountKey, `depth to ${val(beginnerAmt)}`)} (range -50.00 to 50.00).${polarityNote}`,
+              `${ck(connectKey, 'Vibrato')} depth (LFO1 → pitch): ${ck(amountKey, val(expertAmt))}.${polarityNote}`,
+              checkFields,
+              { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Vibrato)', 89), conceptKey: 'vibrato' });
+        return [vibratoStep, ...depthModSteps(vibratoTitle, c)];
       }
-      const destReadable = humanize(c.destination);
+      const destReadable = destDisplayName(c.destination);
       const destShortcut = DEST_SHORTCUT[c.destination];
       const beginnerDest = destShortcut ? shift(destShortcut) : `${selectMenu(destReadable)} (no shortcut pad for this one)`;
       // Session 3: a per-cable, source/destination-specific "why this
@@ -1017,11 +1497,13 @@ function buildGuide(patch) {
       // modmatrix demo, or a pairing cableWhyText() can't say anything
       // useful about, still has a reasonable fallback), but `why` takes
       // priority when rendering (see renderStepFootnotes()).
-      return makeStep(`Patch: ${srcLabel} → ${destReadable}`,
-        `${ck(connectKey, `${beginnerDest} to select the destination, then ${shift(srcLabel)} (in the modulation section) to connect it`)}. Turn SELECT to set ${ck(amountKey, `depth to ${val(beginnerAmt)}`)} (range -50.00 to 50.00).`,
-        `${ck(connectKey, `Route ${val(srcLabel)} → ${val(destReadable)}`)} at ${ck(amountKey, val(expertAmt))}.`,
-        [cf(connectKey, 'Connect'), cf(amountKey, 'Depth')],
+      const patchTitle = `Patch: ${srcLabel} → ${destReadable}`;
+      const patchStep = makeStep(patchTitle,
+        `${ck(connectKey, `${beginnerDest} to select the destination, then ${shift(srcLabel)} (in the modulation section) to connect it`)}. Turn SELECT to set ${ck(amountKey, `depth to ${val(beginnerAmt)}`)} (range -50.00 to 50.00).${polarityNote}${depthNote}`,
+        `${ck(connectKey, `Route ${val(srcLabel)} → ${val(destReadable)}`)} at ${ck(amountKey, val(expertAmt))}.${polarityNote}${depthNote}`,
+        checkFields,
         { manualRef: manualRef('§6.1 "Modulation Routing Basics"', 124), conceptKey: 'modmatrix', why: cableWhyText(c.source, c.destination, dvCable(c.amount)) });
+      return [patchStep, ...depthModSteps(patchTitle, c)];
     });
   push('Modulation matrix', cableSteps);
 
@@ -1038,18 +1520,60 @@ function buildGuide(patch) {
   // --- Mod FX / Delay / Reverb / Sidechain ----------------------------
   const fxSteps = [];
   if (patch.modFXType && patch.modFXType !== INIT.modFXType) {
+    // OFFSET ("Chorus offset") and FEEDBACK ("Flanger & phaser feedback")
+    // are both real, manual-documented MOD-FX shortcut pads (§4.8/§11.7)
+    // that were previously never mentioned anywhere in this app at all --
+    // found via a real target/actual diff where the target's own
+    // modFXOffset was a real, substantial non-default value the rebuild
+    // had no way to even know needed setting.
+    const offsetChanged = dp.modFXOffset && q31Differs(dp.modFXOffset, INIT.modFXOffset);
+    const feedbackChanged = dp.modFXFeedback && q31Differs(dp.modFXFeedback, INIT.modFXFeedback);
     fxSteps.push(makeStep('Mod FX',
-      `${ck('modFXType', `${shift('TYPE')} (under MOD-FX) to ${val(patch.modFXType)}`)}${dp.modFXRate ? `. ${ck('defaultParams.modFXRate', `${shift('RATE')} to ${val(dv(dp.modFXRate))}`)}` : ''}${dp.modFXDepth ? `. ${ck('defaultParams.modFXDepth', `${shift('DEPTH')} to ${val(dv(dp.modFXDepth))}`)}` : ''}.`,
-      `${ck('modFXType', val(patch.modFXType))}${dp.modFXRate ? ` ${ck('defaultParams.modFXRate', `rate ${rawPct(dp.modFXRate)}%`)}` : ''}${dp.modFXDepth ? `, ${ck('defaultParams.modFXDepth', `depth ${rawPct(dp.modFXDepth)}%`)}` : ''}.`,
-      [cf('modFXType', 'Type'), cf('defaultParams.modFXRate', 'Rate'), cf('defaultParams.modFXDepth', 'Depth')],
+      `${ck('modFXType', `${shift('TYPE')} (under MOD-FX) to ${val(patch.modFXType)}`)}${dp.modFXRate ? `. ${ck('defaultParams.modFXRate', `${shift('RATE')} to ${val(dv(dp.modFXRate))}`)}` : ''}${dp.modFXDepth ? `. ${ck('defaultParams.modFXDepth', `${shift('DEPTH')} to ${val(dv(dp.modFXDepth))}`)}` : ''}${offsetChanged ? `. ${ck('defaultParams.modFXOffset', `${shift('OFFSET')} to ${val(dv(dp.modFXOffset))}`)}` : ''}${feedbackChanged ? `. ${ck('defaultParams.modFXFeedback', `${shift('FEEDBACK')} to ${val(dv(dp.modFXFeedback))}`)}` : ''}.`,
+      `${ck('modFXType', val(patch.modFXType))}${dp.modFXRate ? ` ${ck('defaultParams.modFXRate', `rate ${rawPct(dp.modFXRate)}%`)}` : ''}${dp.modFXDepth ? `, ${ck('defaultParams.modFXDepth', `depth ${rawPct(dp.modFXDepth)}%`)}` : ''}${offsetChanged ? `, ${ck('defaultParams.modFXOffset', `offset ${rawPct(dp.modFXOffset)}%`)}` : ''}${feedbackChanged ? `, ${ck('defaultParams.modFXFeedback', `feedback ${rawPct(dp.modFXFeedback)}%`)}` : ''}.`,
+      [cf('modFXType', 'Type'), cf('defaultParams.modFXRate', 'Rate'), cf('defaultParams.modFXDepth', 'Depth'), cf('defaultParams.modFXOffset', 'Offset'), cf('defaultParams.modFXFeedback', 'Feedback')],
       { manualRef: manualRef('§11.7 "Modulation Effects"', 235), conceptKey: 'modfx' }));
   }
   const delay = patch.delay;
+  // Amount/Rate get their own step, split off from PingPong/Analog/Sync:
+  // both are real MIDI-Follow-mappable params, but PingPong/Analog (plain
+  // on/off flags) and Sync (a list, see syncLevelName()'s own comment) are
+  // neither -- bundling all five into one step's checkFields used to
+  // disqualify the *whole* step from ever going live (isLiveStep()'s "one
+  // uncovered field disqualifies the whole step" rule), same class of bug
+  // as the earlier LPF/HPF Mode split. Reported directly against real
+  // hardware: "Delay amount and rate are live values".
   if (dp.delayFeedback && q31Differs(dp.delayFeedback, INIT.delayFeedback)) {
     fxSteps.push(makeStep('Delay',
-      `${ck('defaultParams.delayFeedback', `${shift('AMOUNT')} (under FX/DELAY) to ${val(dv(dp.delayFeedback))}`)}${dp.delayRate ? `. ${ck('defaultParams.delayRate', `${shift('RATE')} to ${val(dv(dp.delayRate))}`)}` : ''}${delay && delay.pingPong === '1' ? `. ${ck('delay.pingPong', `${shift('PINGPONG')} on`)}` : ''}${delay && delay.analog === '1' ? `. ${ck('delay.analog', `${shift('TYPE')} to ${val('ANALOG')}`)}` : ''}.`,
-      `${ck('defaultParams.delayFeedback', `Delay feedback ${val(rawPct(dp.delayFeedback) + '%')}`)}${delay && delay.pingPong === '1' ? `, ${ck('delay.pingPong', 'ping-pong')}` : ''}.`,
-      [cf('defaultParams.delayFeedback', 'Amount'), cf('defaultParams.delayRate', 'Rate'), cf('delay.pingPong', 'PingPong'), cf('delay.analog', 'Analog')],
+      `${ck('defaultParams.delayFeedback', `${shift('AMOUNT')} (under FX/DELAY) to ${val(dv(dp.delayFeedback))}`)}${dp.delayRate ? `. ${ck('defaultParams.delayRate', `${shift('RATE')} to ${val(dv(dp.delayRate))}`)}` : ''}.`,
+      `${ck('defaultParams.delayFeedback', `Delay feedback ${val(rawPct(dp.delayFeedback) + '%')}`)}${dp.delayRate ? `, ${ck('defaultParams.delayRate', `rate ${val(rawPct(dp.delayRate) + '%')}`)}` : ''}.`,
+      [cf('defaultParams.delayFeedback', 'Amount'), cf('defaultParams.delayRate', 'Rate')],
+      { manualRef: manualRef('§11.5 "Delay"', 228), conceptKey: 'delay' }));
+  }
+  // Delay's own tempo-sync (manual §11.5/grid shortcuts: "SYNC -- Time
+  // interval to sync the Delay or OFF") was previously uncovered here --
+  // asymmetric with the SAME "SYNC" concept already tracked for the
+  // sidechain compressor below. A real target/actual diff found this
+  // genuinely differing (target wanted sync level 8, the rebuild was still
+  // sitting at the init default 7) -- a real, audible difference in delay
+  // repeat timing, not just cosmetic.
+  const delaySyncChanged = delay && plainDiffers(delay.syncLevel, INIT.delaySyncLevel);
+  const delayPingPongOn = delay && delay.pingPong === '1';
+  const delayAnalogOn = delay && delay.analog === '1';
+  if (delayPingPongOn || delayAnalogOn || delaySyncChanged) {
+    const beginnerParts = [
+      delayPingPongOn && ck('delay.pingPong', `${shift('PINGPONG')} on`),
+      delayAnalogOn && ck('delay.analog', `${shift('TYPE')} to ${val('ANALOG')}`),
+      delaySyncChanged && ck('delay.syncLevel', `${shift('SYNC')} to ${val(syncLevelName(delay.syncLevel))}`),
+    ].filter(Boolean);
+    const expertParts = [
+      delayPingPongOn && ck('delay.pingPong', 'ping-pong'),
+      delaySyncChanged && ck('delay.syncLevel', `synced to ${val(syncLevelName(delay.syncLevel))}`),
+    ].filter(Boolean);
+    fxSteps.push(makeStep('Delay settings',
+      `${beginnerParts.join('. ')}.`,
+      `${expertParts.join(', ')}.`,
+      [cf('delay.pingPong', 'PingPong'), cf('delay.analog', 'Analog'), cf('delay.syncLevel', 'Sync')],
       { manualRef: manualRef('§11.5 "Delay"', 228), conceptKey: 'delay' }));
   }
   if (dp.reverbAmount && q31Differs(dp.reverbAmount, INIT.reverbAmount)) {
@@ -1065,7 +1589,7 @@ function buildGuide(patch) {
   const sc = patch.sidechain;
   if (sc && (plainDiffers(sc.attack, INIT.sidechain.attack) || plainDiffers(sc.release, INIT.sidechain.release) || plainDiffers(sc.syncLevel, INIT.sidechain.syncLevel))) {
     push('Sidechain compressor', [makeStep('Ducking envelope',
-      `${ck('sidechain.attack', shift('ATTACK'))} and ${ck('sidechain.release', shift('RELEASE'))} (under SIDECHAIN COMPRESSOR) to ${ck('sidechain.attack', `attack ${val(sc.attack)}`)}, ${ck('sidechain.release', `release ${val(sc.release)}`)}${sc.syncLevel ? `. ${ck('sidechain.syncLevel', `${shift('SYNC')} to level ${val(sc.syncLevel)}`)}` : ''}.`,
+      `${ck('sidechain.attack', shift('ATTACK'))} and ${ck('sidechain.release', shift('RELEASE'))} (under SIDECHAIN COMPRESSOR) to ${ck('sidechain.attack', `attack ${val(sc.attack)}`)}, ${ck('sidechain.release', `release ${val(sc.release)}`)}${sc.syncLevel && sc.syncLevel !== '0' ? `. ${ck('sidechain.syncLevel', `${shift('SYNC')} to ${val(syncLevelName(sc.syncLevel))}`)}` : ''}.`,
       `Sidechain compressor: ${ck('sidechain.attack', `attack ${val(sc.attack)}`)}, ${ck('sidechain.release', `release ${val(sc.release)}`)}.`,
       [cf('sidechain.attack', 'Attack'), cf('sidechain.release', 'Release'), cf('sidechain.syncLevel', 'Sync')],
       { manualRef: manualRef('§6.4 "Sidechain Compressor"', 133), conceptKey: 'sidechain' })]);
@@ -1112,6 +1636,19 @@ function buildGuide(patch) {
       `${ck('defaultParams.equalizer.bass', `${shift('ADJUST (BASS)')} to ${val(dv(eq.bass || '0x00000000'))}`)}. ${ck('defaultParams.equalizer.treble', `${shift('ADJUST (TREBLE)')} to ${val(dv(eq.treble || '0x00000000'))}`)}.`,
       `${ck('defaultParams.equalizer.bass', `EQ bass boost ${val(rawPct(eq.bass || '0x00000000') + '%')}`)}, ${ck('defaultParams.equalizer.treble', `treble boost ${val(rawPct(eq.treble || '0x00000000') + '%')}`)}.`,
       [cf('defaultParams.equalizer.bass', 'Bass'), cf('defaultParams.equalizer.treble', 'Treble')],
+      { manualRef: manualRef('§11.4 "EQ - Equalisation"', 225), conceptKey: 'eq' }));
+  }
+  // Separate from the bass/treble boost knobs above: which frequency each
+  // shelf actually pivots at. Previously not covered anywhere at all (found
+  // via real-hardware testing against a preset that moves both) -- no
+  // confirmed dedicated grid-shortcut pad name for these two specifically,
+  // so routed through the nested menu rather than guessing one (same
+  // "don't guess a shortcut" fallback cable steps already use).
+  if (eq && (q31Differs(eq.bassFrequency || '0x00000000', '0x00000000') || q31Differs(eq.trebleFrequency || '0x00000000', '0x00000000'))) {
+    charSteps.push(makeStep('EQ frequency',
+      `${ck('defaultParams.equalizer.bassFrequency', `${selectMenu('SOUND → EQ → BASS FREQUENCY')} to ${val(dv(eq.bassFrequency || '0x00000000'))}`)}. ${ck('defaultParams.equalizer.trebleFrequency', `${selectMenu('SOUND → EQ → TREBLE FREQUENCY')} to ${val(dv(eq.trebleFrequency || '0x00000000'))}`)}.`,
+      `${ck('defaultParams.equalizer.bassFrequency', `EQ bass shelf frequency ${val(rawPct(eq.bassFrequency || '0x00000000') + '%')}`)}, ${ck('defaultParams.equalizer.trebleFrequency', `treble shelf frequency ${val(rawPct(eq.trebleFrequency || '0x00000000') + '%')}`)}.`,
+      [cf('defaultParams.equalizer.bassFrequency', 'Bass freq'), cf('defaultParams.equalizer.trebleFrequency', 'Treble freq')],
       { manualRef: manualRef('§11.4 "EQ - Equalisation"', 225), conceptKey: 'eq' }));
   }
   push('Character & distortion', charSteps);
@@ -1163,7 +1700,41 @@ function buildGuide(patch) {
 // would dwarf the entire real value range and silently pass any mismatch,
 // so they're explicitly given a small rawRange instead.
 const CHECK_SMALL_INT_RANGE = 128;
-function intField(label, path) { return { key: path, label, path, rawRange: CHECK_SMALL_INT_RANGE }; }
+// A "sync level" (delay/sidechain/LFO tempo-sync: manual's own list is
+// "OFF" + 9 note divisions, so ~10 real distinct values) is far too small
+// a range for even CHECK_SMALL_INT_RANGE's own default 2% tolerance
+// (2% of 128 = 2.56) -- verified against a real target/actual pair where
+// a genuine, audible 1-step difference (7 vs 8) still read as "ok" under
+// that looser tolerance. rawRange scales the SAME percentage-based
+// tolerance down to fit this field's actual real-world scale instead.
+const CHECK_SYNC_LEVEL_RANGE = 16;
+// Unison detune/spread's own real range is manual-confirmed 0-50 (§4.x
+// "UNISON DETUNE... A value between 0-50"; stereo spread documented as the
+// same style of parameter, community_features.txt §4.5.2) -- found via a
+// SECOND real target/actual pair still showing a genuine, audible 2-step
+// difference (6 vs 8) reading as "ok" under CHECK_SMALL_INT_RANGE's 2.56
+// tolerance, same class of bug as the sync levels above.
+const CHECK_UNISON_RANGE = 50;
+// A plain on/off flag (delay ping-pong, delay analog/digital) has exactly
+// two valid values -- ANY nonzero tolerance is wrong for it, since "off"
+// and "on" are never "close enough" to each other. Small deliberately not
+// zero (some settings UIs treat a literal 0 tolerance as "disabled" and
+// fall back to a default), but tiny enough that a real 0-vs-1 difference
+// can never be masked by rounding.
+const CHECK_BINARY_RANGE = 2;
+// Pulse width (see dvHalfPrecision()'s own comment) only ever uses the
+// POSITIVE half of the raw q31 range to represent its full 0-50 display
+// scale, unlike every other field this generic percent-of-range tolerance
+// was designed for (which spans the FULL signed range for the same 0-50).
+// Leaving it at the RAW_PARAM_RANGE default silently doubles its real
+// tolerance: the same "2%" ends up covering a FULL display step here
+// instead of the roughly half-a-step every standard field gets, and a real
+// target/actual pair confirmed this let a genuine, audible 9-step gap
+// (target 32, actual 41 -- the actual having been rebuilt by following an
+// earlier, wrong "standard formula" guide instruction) read as "ok". Half
+// of the standard range restores the same relative strictness.
+const CHECK_HALF_PRECISION_RANGE = 0x40000000;
+function intField(label, path, rawRange) { return { key: path, label, path, rawRange: rawRange || CHECK_SMALL_INT_RANGE }; }
 function field(label, path) { return { key: path, label, path }; }
 
 // Patch cables are a list (patchCables.patchCable), not a fixed set of
@@ -1182,6 +1753,32 @@ function cableField(label, source, destination, mode) {
   return { key: `cable:${mode}:${source}->${destination}`, label, cable: { source, destination, mode } };
 }
 
+// A cable's own depth can itself be modulated by MORE THAN ONE second
+// source at once (see cablesOf()'s own comment -- confirmed on a real
+// preset) -- this is one such depth's own amount, checkable independently
+// of the outer cable's connect/amount fields above AND of any other
+// depth-modulator on the same cable. `depthSource` (the modulator's own
+// source) is folded into the key so two modulators on one cable get two
+// distinct, independently-checkable fields rather than colliding on one
+// shared key. Key format otherwise mirrors cableField()'s
+// (`cable:<mode>:<source>-><destination>`) so it resolves through the same
+// lastCheckFieldStatus lookup in stepCheckStatus()/ck() -- just a
+// different "mode" segment (deluge-check.js's resolveFieldValues()
+// dispatches on the presence of `cableDepth` rather than `cable`, since the
+// target cable to look up isn't this pair itself, it's whatever depth-
+// modulates it).
+function cableDepthField(label, source, destination, depthSource, mode) {
+  // `mode` defaults to "amount" (the depth-modulator's own strength) and
+  // keeps the ORIGINAL key format for backward compatibility with every
+  // existing amount field; "polarity" (see depthModStep()'s own comment --
+  // a chained depth modulator has its own bipolar/unipolar, independent of
+  // the outer connection's) gets its own distinct key segment instead.
+  const key = mode === 'polarity'
+    ? `cable:depth:polarity:${source}->${destination}:${depthSource}`
+    : `cable:depth:${source}->${destination}:${depthSource}`;
+  return { key, label, cableDepth: { source, destination, depthSource, mode: mode || 'amount' } };
+}
+
 // Deliberately NOT covered yet (kept out rather than guessed at):
 // - modKnob reassignments, a list with the same single-vs-multiple-entries
 //   XML quirk patch cables used to have (see cableField() above for how
@@ -1190,6 +1787,14 @@ function cableField(label, source, destination, mode) {
 function buildCheckSteps(patch) {
   const isFm = patch.mode === 'fm';
   const steps = [
+    // Previously had no check fields at all in either buildGuide()'s own
+    // "Synth engine mode"/"Polyphony" steps or here -- a real gap found via
+    // real-hardware testing (reported as "polyphony bleibt weiss", i.e.
+    // never colors itself no matter what's actually on the device).
+    { id: 'general', label: 'General', fields: [
+        field('Synth mode', 'mode'),
+        field('Polyphony', 'polyphonic'),
+      ] },
     { id: 'osc', label: 'Oscillators', fields: isFm ? [
         field('Carrier 1 transpose', 'osc1.transpose'),
         field('Carrier 2 transpose', 'osc2.transpose'),
@@ -1200,12 +1805,19 @@ function buildCheckSteps(patch) {
       ] : [
         field('OSC1 type', 'osc1.type'),
         intField('OSC1 transpose', 'osc1.transpose'),
+        intField('OSC1 cents', 'osc1.cents'),
+        intField('OSC1 retrig phase', 'osc1.retrigPhase'),
         field('OSC1 sample', 'osc1.fileName'),
+        intField('OSC1 pulse width', 'defaultParams.oscAPulseWidth', CHECK_HALF_PRECISION_RANGE),
         field('OSC2 type', 'osc2.type'),
         intField('OSC2 transpose', 'osc2.transpose'),
+        intField('OSC2 cents', 'osc2.cents'),
+        intField('OSC2 retrig phase', 'osc2.retrigPhase'),
         field('OSC2 sample', 'osc2.fileName'),
+        intField('OSC2 pulse width', 'defaultParams.oscBPulseWidth', CHECK_HALF_PRECISION_RANGE),
       ] },
     { id: 'mixer', label: 'Mixer', fields: [
+        field('Level', 'defaultParams.volume'),
         field('OSC1 level', 'defaultParams.oscAVolume'),
         field('OSC2 level', 'defaultParams.oscBVolume'),
         field('Noise level', 'defaultParams.noiseVolume'),
@@ -1213,8 +1825,8 @@ function buildCheckSteps(patch) {
       ] },
     { id: 'unison', label: 'Unison', fields: [
         intField('Voice count', 'unison.num'),
-        intField('Detune', 'unison.detune'),
-        intField('Spread', 'unison.spread'),
+        intField('Detune', 'unison.detune', CHECK_UNISON_RANGE),
+        intField('Spread', 'unison.spread', CHECK_UNISON_RANGE),
         field('Portamento', 'defaultParams.portamento'),
       ] },
     { id: 'filter', label: 'Filter', fields: [
@@ -1233,10 +1845,10 @@ function buildCheckSteps(patch) {
     { id: 'lfo', label: 'LFOs', fields: [
         field('LFO1 shape', 'lfo1.type'),
         field('LFO1 rate', 'defaultParams.lfo1Rate'),
-        intField('LFO1 sync level', 'lfo1.syncLevel'),
+        intField('LFO1 sync level', 'lfo1.syncLevel', CHECK_SYNC_LEVEL_RANGE),
         field('LFO2 shape', 'lfo2.type'),
         field('LFO2 rate', 'defaultParams.lfo2Rate'),
-        intField('LFO2 sync level', 'lfo2.syncLevel'),
+        intField('LFO2 sync level', 'lfo2.syncLevel', CHECK_SYNC_LEVEL_RANGE),
       ] },
     { id: 'arp', label: 'Arpeggiator', fields: [
         field('Arp mode', 'arpeggiator.mode'),
@@ -1248,8 +1860,11 @@ function buildCheckSteps(patch) {
         field('Mod FX type', 'modFXType'),
         field('Mod FX rate', 'defaultParams.modFXRate'),
         field('Mod FX depth', 'defaultParams.modFXDepth'),
-        intField('Delay ping-pong', 'delay.pingPong'),
-        intField('Delay analog', 'delay.analog'),
+        field('Mod FX offset', 'defaultParams.modFXOffset'),
+        field('Mod FX feedback', 'defaultParams.modFXFeedback'),
+        intField('Delay ping-pong', 'delay.pingPong', CHECK_BINARY_RANGE),
+        intField('Delay analog', 'delay.analog', CHECK_BINARY_RANGE),
+        intField('Delay sync level', 'delay.syncLevel', CHECK_SYNC_LEVEL_RANGE),
         field('Delay rate', 'defaultParams.delayRate'),
         field('Delay feedback', 'defaultParams.delayFeedback'),
         field('Reverb send', 'defaultParams.reverbAmount'),
@@ -1257,7 +1872,7 @@ function buildCheckSteps(patch) {
     { id: 'sidechain', label: 'Sidechain compressor', fields: [
         field('Sidechain attack', 'sidechain.attack'),
         field('Sidechain release', 'sidechain.release'),
-        intField('Sidechain sync level', 'sidechain.syncLevel'),
+        intField('Sidechain sync level', 'sidechain.syncLevel', CHECK_SYNC_LEVEL_RANGE),
       ] },
     { id: 'character', label: 'Character & distortion', fields: [
         intField('Saturation amount', 'clippingAmount'),
@@ -1266,15 +1881,32 @@ function buildCheckSteps(patch) {
         field('Wavefolder', 'defaultParams.waveFold'),
         field('EQ bass', 'defaultParams.equalizer.bass'),
         field('EQ treble', 'defaultParams.equalizer.treble'),
+        field('EQ bass frequency', 'defaultParams.equalizer.bassFrequency'),
+        field('EQ treble frequency', 'defaultParams.equalizer.trebleFrequency'),
       ] },
     { id: 'modmatrix', label: 'Modulation matrix', fields: cablesOf(patch)
         .filter(c => c.source && c.destination && !cableIsDefault(c))
         .flatMap(c => {
-          const label = `${humanize(c.source)} → ${humanize(c.destination)}`;
-          return [
+          const label = `${humanize(c.source)} → ${destDisplayName(c.destination)}`;
+          const fields = [
             cableField(`${label} (connected)`, c.source, c.destination, 'connect'),
             cableField(`${label} (depth)`, c.source, c.destination, 'amount'),
           ];
+          // X/Y (MPE expression) can't have their polarity changed at all
+          // (see cableHasPolarity()'s own comment) -- no field for those.
+          if (cableHasPolarity(c.source)) {
+            fields.push(cableField(`${label} (polarity)`, c.source, c.destination, 'polarity'));
+          }
+          for (const m of c.depthModulators || []) {
+            const depthSrcLabel = SOURCE_LABEL[m.source] || humanize(m.source);
+            fields.push(cableDepthField(`${label} (depth modulated by ${depthSrcLabel})`, c.source, c.destination, m.source));
+            // A chained depth modulator has its own polarity, independent
+            // of the outer connection's (see depthModStep()'s comment).
+            if (cableHasPolarity(m.source)) {
+              fields.push(cableDepthField(`${label} (depth modulated by ${depthSrcLabel}, polarity)`, c.source, c.destination, m.source, 'polarity'));
+            }
+          }
+          return fields;
         }) },
   ];
   return steps;
@@ -1396,22 +2028,49 @@ function buildModMatrixTable(patch) {
   // pair is unique on the Deluge, so at most one cable ever lands in a cell.
   const sourceOrder = [];
   const destOrder = [];
+  const destLabel = new Map();
   const cellByKey = new Map();
   for (const c of cables) {
     if (!sourceOrder.includes(c.source)) sourceOrder.push(c.source);
-    if (!destOrder.includes(c.destination)) destOrder.push(c.destination);
+    if (!destOrder.includes(c.destination)) { destOrder.push(c.destination); destLabel.set(c.destination, destDisplayName(c.destination)); }
     cellByKey.set(`${c.source}\u0000${c.destination}`, c);
+    // See cablesOf()'s own comment: a cable's own depth can itself be
+    // modulated by MORE THAN ONE second source at once (a "double mod",
+    // confirmed on a real preset with two simultaneous modulators).
+    // Previously only a hover-only "†" footnote on the outer cell --
+    // upgraded to a real, synthetic extra column PER modulator instead. The
+    // COLUMN is labeled with the OUTER cable's own source (what's actually
+    // being touched -- "LFO1's own depth"), not the modulator's source --
+    // an earlier version of this mislabeled it with the modulator's own
+    // source instead, so e.g. RANDOM modulating LFO1's depth showed as a
+    // nonsense "random -> random" row/column pair instead of the correct
+    // "random -> LFO1" reading.
+    for (const m of c.depthModulators || []) {
+      const depthSrc = m.source;
+      const depthKey = `__depth__${c.source}__${c.destination}__${depthSrc}`;
+      if (!sourceOrder.includes(depthSrc)) sourceOrder.push(depthSrc);
+      if (!destOrder.includes(depthKey)) { destOrder.push(depthKey); destLabel.set(depthKey, SOURCE_LABEL[c.source] || humanize(c.source)); }
+      cellByKey.set(`${depthSrc}\u0000${depthKey}`, { isDepthCell: true, amount: m.amount, ofSource: c.source, ofDestination: c.destination });
+    }
   }
-  const destHeaderCells = destOrder.map(d => `<th>${humanize(d)}</th>`).join('');
+  const destHeaderCells = destOrder.map(d => d.startsWith('__depth__')
+    ? `<th class="mm-depth-col" title="Depth modulation -- this column is another cable's own modulation depth, not a normal destination">${destLabel.get(d)}</th>`
+    : `<th>${destLabel.get(d)}</th>`).join('');
   const bodyRows = sourceOrder.map(s => {
     const cells = destOrder.map(d => {
       const c = cellByKey.get(`${s}\u0000${d}`);
       if (!c) return '<td class="mm-empty">&middot;</td>';
-      const isDefault = cableIsDefault(c);
       const amt = dvCable(c.amount);
       const magnitudePct = (Math.abs(amt) / 50) * 100;
       const barLeft = amt < 0 ? 50 - magnitudePct / 2 : 50;
       const barWidth = magnitudePct / 2;
+      if (c.isDepthCell) {
+        const ofLabel = `${SOURCE_LABEL[c.ofSource] || humanize(c.ofSource)} → ${destDisplayName(c.ofDestination)}`;
+        return `<td class="mm-cell mm-depth-cell" title="Depth of ${escapeHtml(ofLabel)}'s own modulation amount">
+          <span class="amount-bar"><span style="left:${barLeft}%;width:${barWidth}%"></span></span>${fmtCable(c.amount)}
+        </td>`;
+      }
+      const isDefault = cableIsDefault(c);
       return `<td class="mm-cell${isDefault ? ' is-default' : ''}" title="${isDefault ? 'Default (unchanged from init)' : 'Custom routing'}">
         <span class="amount-bar"><span style="left:${barLeft}%;width:${barWidth}%"></span></span>${fmtCable(c.amount)}
       </td>`;
@@ -1424,7 +2083,9 @@ function buildModMatrixTable(patch) {
     </table>`;
   return `
     <p class="empty-note" style="padding:0 0 12px">Depth shown is the Deluge's own -50.00 to 50.00 scale. Muted cells are
-      unchanged from the init patch's built-in routings; highlighted cells are this preset's own choices.</p>
+      unchanged from the init patch's built-in routings; highlighted cells are this preset's own choices.
+      A shaded column header (e.g. "LFO 1") isn't a normal destination -- it's another cable's own modulation
+      depth, itself being modulated by a second source (a "double mod").</p>
     ${makeZoomable(table)}`;
 }
 
@@ -1451,6 +2112,23 @@ function sdArrow(x1, y1, x2, y2, dashed, label, color) {
   const style = color ? ` style="stroke:${color}"` : '';
   const path = `<path class="sd-arrow${dashed ? ' mod' : ''}" d="M${x1},${y1} C${x1 + (x2 - x1) / 2},${y1} ${x1 + (x2 - x1) / 2},${y2} ${x2},${y2}"${style}/>`;
   const lbl = label ? `<text class="sd-mod-label" x="${(x1 + x2) / 2}" y="${Math.min(y1, y2) - 4}" text-anchor="middle">${label}</text>` : '';
+  return path + lbl;
+}
+// A source modulating its own outgoing cable's depth (a real "double mod",
+// see cablesOf()'s own comment) has no second box to point at -- drawn as a
+// small loop leaving and re-entering the SAME box's bottom edge instead.
+// Always the dashed/"mod" style (see sdArrow() above): no arrowhead, same
+// muted-but-colored treatment as every other modulation-only line.
+// `loopIndex` (0, 1, 2, ...) nudges each additional loop off the SAME box
+// further down, so two simultaneous self-loops (a cable modulated by its
+// own source in more than one way -- rare, but the underlying data model
+// allows it) don't draw exactly on top of each other.
+function sdSelfLoop(box, label, color, loopIndex) {
+  const x1 = box.cx + (box.right - box.left) * 0.18, x2 = box.cx - (box.right - box.left) * 0.18;
+  const y0 = box.bottom, loopY = y0 + 22 + (loopIndex || 0) * 18;
+  const style = color ? ` style="stroke:${color}"` : '';
+  const path = `<path class="sd-arrow mod" d="M${x1},${y0} C${x1},${loopY} ${x2},${loopY} ${x2},${y0}"${style}/>`;
+  const lbl = label ? `<text class="sd-mod-label" x="${box.cx}" y="${loopY + 11}" text-anchor="middle">${label}</text>` : '';
   return path + lbl;
 }
 // One fixed, distinct color per modulation source, consistent across every
@@ -1688,13 +2366,31 @@ function buildSignalPathSvg(patch, idPrefix) {
   // aren't cables: ENV2 is always the filter envelope, sidechain always
   // ducks the amp) drawn once, fanning out to every box it actually
   // modulates. Hovering a source shows its full target + amount list.
+  // A whole-library sweep (every non-default cable in every real preset)
+  // found this list covered only a fraction of the destinations cables
+  // actually target in practice -- ~400 real cables across the library
+  // landed on a destination this map didn't know, so their source was
+  // silently missing from the diagram entirely (reported as "random fehlt
+  // im Signalpfad" for one specific case, but the same class of gap hit
+  // dozens of other destinations too). Extended to cover every destination
+  // that maps cleanly onto a box already drawn somewhere in this diagram;
+  // see below (near the lane-node loops) for lfo1Rate/lfo2Rate and the
+  // envelope attack/decay/sustain/release destinations, which don't have a
+  // "signal chain" box at all and are handled the same way as a cable's
+  // own chained depth modulator instead (an arrow to that source's own
+  // lane node, or a self-loop).
   const DEST_TO_BOX = {
-    volume: amp, pan: out,
+    volume: amp, pan: out, volumePostReverbSend: out,
     lpfFrequency: lpfBoxRef, lpfResonance: lpfBoxRef,
     hpfFrequency: hpfBoxRef, hpfResonance: hpfBoxRef,
-    oscAVolume: sources[0], oscAPhaseWidth: sources[0], oscAPitch: sources[0],
-    oscBVolume: sources[1], oscBPhaseWidth: sources[1], oscBPitch: sources[1],
+    oscAVolume: sources[0], oscAPhaseWidth: sources[0], oscAPitch: sources[0], oscAWavetablePosition: sources[0],
+    oscBVolume: sources[1], oscBPhaseWidth: sources[1], oscBPitch: sources[1], oscBWavetablePosition: sources[1],
+    noiseVolume: sources[2],
     pitch: mixer,
+    modulator1Volume: mod1, modulator1Pitch: mod1, modulator1Feedback: mod1, carrier1Feedback: sources[0],
+    modulator2Volume: mod2, modulator2Pitch: mod2, modulator2Feedback: mod2, carrier2Feedback: sources[1],
+    modFXRate: modfx, modFXDepth: modfx,
+    delayRate: delayB, delayFeedback: delayB,
   };
   // Envelope 1 -> amp volume is exactly as structural/always-on as envelope
   // 2 -> filter cutoff (neither is an explicit patch cable), so it gets the
@@ -1702,7 +2398,22 @@ function buildSignalPathSvg(patch, idPrefix) {
   addNode('envelope1', 'ENV 1', amp, 'Amp volume', 'structural, always on');
   addNode('envelope2', 'ENV 2', lpfBoxRef, 'Filter cutoff', 'structural, always on');
   if (scOn) addNode('sidechain-comp', 'SIDECHAIN', amp, 'Amp volume (ducking)', `attack ${sc.attack}, release ${sc.release}`);
+  // Some destinations aren't on the main audio-signal chain at all -- they
+  // ARE another modulation source's own rate/envelope-time (e.g. LFO2
+  // speeding up LFO1, or velocity shortening ENV1's attack). No box in
+  // this diagram represents "LFO1"/"ENV1" as a destination the way
+  // lpfFrequency/amp/etc. do, so these skip DEST_TO_BOX entirely and are
+  // instead handled below alongside chained depth modulators, pointed at
+  // that source's own lane node (a self-loop if the modulator IS that same
+  // source, an ordinary lane-to-lane arrow otherwise) -- the exact same
+  // "no destination box, point at a lane node instead" treatment.
+  const RATE_OR_ENV_DEST_TO_SOURCE_KEY = {
+    lfo1Rate: 'lfo1', lfo2Rate: 'lfo2',
+    env1Attack: 'envelope1', env1Decay: 'envelope1', env1Sustain: 'envelope1', env1Release: 'envelope1',
+    env2Attack: 'envelope2', env2Decay: 'envelope2', env2Sustain: 'envelope2', env2Release: 'envelope2',
+  };
   nonDefaultCables.forEach(c => {
+    if (RATE_OR_ENV_DEST_TO_SOURCE_KEY[c.destination]) return; // handled below
     const target = DEST_TO_BOX[c.destination];
     if (!target) return;
     // A patch cable from the compressor (real XML source="compressor") is
@@ -1711,7 +2422,7 @@ function buildSignalPathSvg(patch, idPrefix) {
     // and its tooltip merges into the one SIDECHAIN node instead of
     // spawning a second, differently-colored, mislabeled "Compressor" node.
     const key = c.source === 'compressor' ? 'sidechain-comp' : c.source;
-    addNode(key, SOURCE_LABEL[key] || humanize(c.source), target, humanize(c.destination), fmtCable(c.amount));
+    addNode(key, SOURCE_LABEL[key] || humanize(c.source), target, destDisplayName(c.destination), fmtCable(c.amount));
   });
 
   // A node's own source settings (its ADSR, shape/rate, etc.) shown above
@@ -1735,7 +2446,7 @@ function buildSignalPathSvg(patch, idPrefix) {
     if (!targetsByKey.has(n.key)) targetsByKey.set(n.key, []);
     n.targets.forEach(t => targetsByKey.get(n.key).push(`→ ${t.destLabel}: ${t.amountText}`));
   });
-  const tooltipFor = key => [ownInfo.get(key), ...targetsByKey.get(key)].filter(Boolean).join('\n');
+  const tooltipFor = key => [ownInfo.get(key), ...(targetsByKey.get(key) || [])].filter(Boolean).join('\n');
 
   // Shared 1-D layout: place items near their natural position (anchorOf),
   // but when several land on essentially the same spot, spread them out
@@ -1770,6 +2481,11 @@ function buildSignalPathSvg(patch, idPrefix) {
   const leftGapNodes = nodes.filter(n => leftGapTargets.includes(n.box));
   const laneNodes = nodes.filter(n => !leftGapNodes.includes(n));
 
+  // Placed lane-node box per source key -- needed below to draw a
+  // depth-modulates-depth loop/arrow, which points at a SOURCE's own lane
+  // node rather than at any destination box, so it has to wait until lane
+  // nodes are actually positioned.
+  const laneBoxByKey = new Map();
   if (leftGapNodes.length) {
     const gapLeft = 20;
     const gapTop = Math.min(...leftGapTargets.map(b => b.top));
@@ -1777,6 +2493,7 @@ function buildSignalPathSvg(patch, idPrefix) {
     gapPositioned.forEach(p => {
       const color = sourceColor(p.e.key);
       const node = place(sdBox(gapLeft, p.pos - MOD_NODE_H / 2, MOD_NODE_W, MOD_NODE_H, p.e.label, null, 'lane', tooltipFor(p.e.key), color));
+      laneBoxByKey.set(p.e.key, node);
       arrows.push(sdArrow(node.right, node.cy, p.e.box.left, p.e.box.cy, true, null, color));
     });
   }
@@ -1787,12 +2504,73 @@ function buildSignalPathSvg(patch, idPrefix) {
   lanePositioned.forEach(p => {
     const color = sourceColor(p.e.key);
     const node = place(sdBox(p.pos - MOD_NODE_W / 2, laneY, MOD_NODE_W, 30, p.e.label, null, 'lane', tooltipFor(p.e.key), color));
+    laneBoxByKey.set(p.e.key, node);
     laneRight = Math.max(laneRight, node.right);
     arrows.push(sdArrow(node.cx, node.top, p.e.box.cx, p.e.box.bottom, true, null, color));
   });
 
+  // Two kinds of connection have no "normal" destination box to point an
+  // arrow at, because what they modulate IS another modulation source
+  // itself, not a spot on the audio-signal chain:
+  //  - a cable's own depth being modulated by a second source (see
+  //    cablesOf()'s own comment, a "double mod") -- modulates the OUTER
+  //    cable's source's own lane node.
+  //  - a cable whose destination is literally another source's own rate/
+  //    envelope-time (RATE_OR_ENV_DEST_TO_SOURCE_KEY above, e.g. LFO2 ->
+  //    lfo1Rate) -- modulates THAT source's own lane node directly.
+  // Both get the identical treatment: a genuine self-loop when the
+  // modulator IS that same source (e.g. LFO1's own vibrato depth modulated
+  // by LFO1 again), an ordinary arrow between two lane nodes otherwise.
+  // Either side of that arrow might have no OTHER direct routing anywhere
+  // in the signal chain (e.g. RANDOM used only to modulate a different
+  // cable's own depth, or an LFO whose only "activity" is being modulated
+  // by something else) -- addNode() never ran for it, so getOrCreateLaneBox
+  // synthesizes a small lane node on demand instead of silently dropping
+  // that source from the diagram entirely (reported: "random fehlt als
+  // Modulationsquelle").
+  function getOrCreateLaneBox(key) {
+    const existing = laneBoxByKey.get(key);
+    if (existing) return existing;
+    const label = SOURCE_LABEL[key] || humanize(key);
+    const box = place(sdBox(laneRight + MOD_NODE_GAP, laneY, MOD_NODE_W, 30, label, null, 'lane', ownInfo.get(key) || label, sourceColor(key)));
+    laneBoxByKey.set(key, box);
+    laneRight = Math.max(laneRight, box.right);
+    return box;
+  }
+  // A cable can have MORE THAN ONE simultaneous depth-modulator (confirmed
+  // on a real preset, BOC01/BOD01_49-From the distance.XML: LFO1's own
+  // vibrato depth modulated by BOTH lfo1 AND random at once) --
+  // loopCountByBox nudges each additional self-loop off the SAME box
+  // further down so two loops never draw exactly on top of each other.
+  let loopBottom = 0;
+  const loopCountByBox = new Map();
+  function drawSourceToSourceArrow(targetKey, modulatorKey) {
+    const targetBox = getOrCreateLaneBox(targetKey);
+    if (modulatorKey === targetKey) {
+      const loopIndex = loopCountByBox.get(targetBox) || 0;
+      loopCountByBox.set(targetBox, loopIndex + 1);
+      arrows.push(sdSelfLoop(targetBox, null, sourceColor(targetKey), loopIndex));
+      loopBottom = Math.max(loopBottom, targetBox.bottom + 33 + loopIndex * 18);
+    } else {
+      const modBox = getOrCreateLaneBox(modulatorKey);
+      arrows.push(sdArrow(modBox.cx, modBox.bottom, targetBox.cx, targetBox.bottom, true, null, sourceColor(modulatorKey)));
+    }
+  }
+  nonDefaultCables.forEach(c => {
+    for (const m of c.depthModulators || []) {
+      const outerKey = c.source === 'compressor' ? 'sidechain-comp' : c.source;
+      const depthKey = m.source === 'compressor' ? 'sidechain-comp' : m.source;
+      drawSourceToSourceArrow(outerKey, depthKey);
+    }
+    const rateOrEnvTarget = RATE_OR_ENV_DEST_TO_SOURCE_KEY[c.destination];
+    if (rateOrEnvTarget) {
+      const modKey = c.source === 'compressor' ? 'sidechain-comp' : c.source;
+      drawSourceToSourceArrow(rateOrEnvTarget, modKey);
+    }
+  });
+
   const totalWidth = Math.max(x, out.right + 20, laneRight + 20);
-  const totalHeight = maxY + 24;
+  const totalHeight = Math.max(maxY + 24, loopBottom + 10);
   const svg = `<svg id="${svgId}" viewBox="0 0 ${totalWidth} ${totalHeight}" width="${totalWidth}" height="${totalHeight}" xmlns="http://www.w3.org/2000/svg">${defs}${arrows.join('')}${boxes.join('')}</svg>`;
   return makeZoomable(svg, 'signal-diagram-wrap');
 }
@@ -3872,6 +4650,7 @@ function conceptForCheckKey(key) {
   if (k.includes('bitcrush') || k.includes('sampleratereduction') || k.includes('clippingamount')) return 'distortion';
   if (k.includes('wavefold')) return 'wavefold';
   if (k.includes('equalizer')) return 'eq';
+  if (k.endsWith('.volume')) return 'mixer.level';
   if (k.includes('oscbvolume') || k.includes('noisevolume') || k.includes('oscavolume')) return 'mixer.balance';
   if (k.includes('.pan') || k === 'pan') return 'mixer.pan';
   if (k.includes('modulator')) return 'fm';
@@ -3880,11 +4659,118 @@ function conceptForCheckKey(key) {
   return null;
 }
 
+// "Unexpected" (see fieldStatus() in deluge-check.js) means the TARGET is
+// at its default and the actual/device value ISN'T -- so the fix is always
+// "put this back to its default", and there's frequently no guide step
+// anywhere that ever mentions the shortcut, since buildGuide() only ever
+// generates a step for a NON-default value. Reported as too generic to
+// act on ("OSC1 cents ist zu generisch, der user muss wissen auf welchen
+// wert er zurückstellen muss und wie") -- this maps a checkField's own
+// path to the exact same shortcut wording buildGuide()'s own describeXXX()
+// functions use for that field elsewhere, plus an optional display-format
+// override for values that need a unit suffix or aren't raw q31 hex.
+// Deliberately not exhaustive: a field missing here still shows its reset
+// VALUE (see evaluateSteps()'s resetValue, always accurate, no guessing
+// involved) with a generic "via the SOUND menu" fallback rather than
+// silently showing nothing.
+const CHECK_FIELD_RESET_HOW = {
+  mode: { how: shift('SYNTH MODE'), format: v => v.toUpperCase() },
+  polyphonic: { how: shift('POLYPHONY'), format: v => v.toUpperCase() },
+  'osc1.type': { how: shift('OSC1 TYPE'), format: v => v.toUpperCase() },
+  'osc1.transpose': { how: shift('OSC1 TRANSPOSE'), format: v => `${v} st` },
+  'osc1.cents': { how: `${shift('OSC1 TRANSPOSE')} (fine-tune)`, format: v => `${v} cents` },
+  'osc1.retrigPhase': { how: shift('OSC1 RETRIG PHASE'), format: v => v === '-1' ? 'off' : v },
+  'osc2.type': { how: shift('OSC2 TYPE'), format: v => v.toUpperCase() },
+  'osc2.transpose': { how: shift('OSC2 TRANSPOSE'), format: v => `${v} st` },
+  'osc2.cents': { how: `${shift('OSC2 TRANSPOSE')} (fine-tune)`, format: v => `${v} cents` },
+  'osc2.retrigPhase': { how: shift('OSC2 RETRIG PHASE'), format: v => v === '-1' ? 'off' : v },
+  'modulator1.transpose': { how: shift('MOD1 TRANSPOSE'), format: v => `${v} st` },
+  'modulator2.transpose': { how: shift('MOD2 TRANSPOSE'), format: v => `${v} st` },
+  'defaultParams.modulator1Amount': { how: shift('MOD1 LEVEL') },
+  'defaultParams.modulator2Amount': { how: shift('MOD2 LEVEL') },
+  'defaultParams.oscAPulseWidth': { how: shift(DEST_SHORTCUT.oscAPhaseWidth), format: dvHalfPrecision },
+  'defaultParams.oscBPulseWidth': { how: shift(DEST_SHORTCUT.oscBPhaseWidth), format: dvHalfPrecision },
+  'defaultParams.volume': { how: shift(DEST_SHORTCUT.volume) },
+  'defaultParams.oscAVolume': { how: shift('OSC1 LEVEL') },
+  'defaultParams.oscBVolume': { how: shift('OSC2 LEVEL') },
+  'defaultParams.noiseVolume': { how: shift('NOISE') },
+  'defaultParams.pan': { how: shift('PAN'), format: v => dvPan(v) },
+  'unison.num': { how: `${shift('NUMBER')} (under VOICE)` },
+  'unison.detune': { how: `${shift('DETUNE')} (under VOICE)` },
+  'unison.spread': { how: 'via the SOUND menu (no dedicated shortcut pad for spread)' },
+  'defaultParams.portamento': { how: `${shift('PORTA')} (under VOICE)` },
+  'defaultParams.lpfFrequency': { how: `${shift('FREQUENCY')} (under LPF)` },
+  'defaultParams.lpfResonance': { how: `${shift('RESONANCE')} (under LPF)` },
+  lpfMode: { how: `${shift('DB/OCT')} (under LPF)` },
+  'defaultParams.hpfFrequency': { how: `${shift('FREQUENCY')} (under HPF)` },
+  'defaultParams.hpfResonance': { how: `${shift('RESONANCE')} (under HPF)` },
+  hpfMode: { how: `${selectMenu('HPF &gt; MODE')} (no dedicated shortcut pad)` },
+  filterRoute: { how: selectMenu('SOUND &gt; FILTER ROUTE') },
+  'defaultParams.envelope1.attack': { how: `${shift('ATTACK')} (Envelope 1)` },
+  'defaultParams.envelope1.decay': { how: `${shift('DECAY')} (Envelope 1)` },
+  'defaultParams.envelope1.sustain': { how: `${shift('SUSTAIN')} (Envelope 1)` },
+  'defaultParams.envelope1.release': { how: `${shift('RELEASE')} (Envelope 1)` },
+  'defaultParams.envelope2.attack': { how: `${shift('ATTACK')} (Envelope 2)` },
+  'defaultParams.envelope2.decay': { how: `${shift('DECAY')} (Envelope 2)` },
+  'defaultParams.envelope2.sustain': { how: `${shift('SUSTAIN')} (Envelope 2)` },
+  'defaultParams.envelope2.release': { how: `${shift('RELEASE')} (Envelope 2)` },
+  'lfo1.type': { how: shift('LFO1 SHAPE'), format: v => v.toUpperCase() },
+  'defaultParams.lfo1Rate': { how: shift('LFO1 RATE') },
+  'lfo1.syncLevel': { how: shift('LFO1 SYNC'), format: syncLevelName },
+  'lfo2.type': { how: shift('LFO2 SHAPE'), format: v => v.toUpperCase() },
+  'defaultParams.lfo2Rate': { how: shift('LFO2 RATE') },
+  'lfo2.syncLevel': { how: shift('LFO2 SYNC'), format: syncLevelName },
+  'arpeggiator.mode': { how: `${shift('MODE')} (under VOICE)`, format: v => v.toUpperCase() },
+  'arpeggiator.numOctaves': { how: `${shift('NUMBER OF OCTAVES')} (under VOICE)` },
+  'defaultParams.arpeggiatorGate': { how: `${shift('GATE')} (under VOICE)` },
+  'defaultParams.arpeggiatorRate': { how: `${shift('RATE')} (under VOICE)` },
+  modFXType: { how: `${shift('TYPE')} (under MOD-FX)`, format: v => v.toUpperCase() },
+  'defaultParams.modFXRate': { how: `${shift('RATE')} (under MOD-FX)` },
+  'defaultParams.modFXDepth': { how: `${shift('DEPTH')} (under MOD-FX)` },
+  'defaultParams.modFXOffset': { how: `${shift('OFFSET')} (under MOD-FX)` },
+  'defaultParams.modFXFeedback': { how: `${shift('FEEDBACK')} (under MOD-FX)` },
+  'delay.pingPong': { how: `${shift('PINGPONG')} (under FX/DELAY)`, format: v => v === '1' ? 'on' : 'off' },
+  'delay.analog': { how: `${shift('TYPE')} (under FX/DELAY)`, format: v => v === '1' ? 'ANALOG' : 'DIGITAL' },
+  'delay.syncLevel': { how: `${shift('SYNC')} (under FX/DELAY)`, format: syncLevelName },
+  'defaultParams.delayRate': { how: `${shift('RATE')} (under FX/DELAY)` },
+  'defaultParams.delayFeedback': { how: `${shift('AMOUNT')} (under FX/DELAY)` },
+  'defaultParams.reverbAmount': { how: `${shift('AMOUNT')} (under REVERB)` },
+  'sidechain.attack': { how: `${shift('ATTACK')} (under SIDECHAIN COMPRESSOR)` },
+  'sidechain.release': { how: `${shift('RELEASE')} (under SIDECHAIN COMPRESSOR)` },
+  'sidechain.syncLevel': { how: `${shift('SYNC')} (under SIDECHAIN COMPRESSOR)`, format: syncLevelName },
+  clippingAmount: { how: shift('SATURATION') },
+  'defaultParams.bitCrush': { how: shift('BITCRUSH') },
+  'defaultParams.sampleRateReduction': { how: shift('DECIMATION') },
+  'defaultParams.waveFold': { how: `via the SOUND menu (${selectMenu('SOUND &gt; WAVEFOLD')})` },
+  'defaultParams.equalizer.bass': { how: shift('ADJUST (BASS)') },
+  'defaultParams.equalizer.treble': { how: shift('ADJUST (TREBLE)') },
+  'defaultParams.equalizer.bassFrequency': { how: selectMenu('SOUND → EQ → BASS FREQUENCY') },
+  'defaultParams.equalizer.trebleFrequency': { how: selectMenu('SOUND → EQ → TREBLE FREQUENCY') },
+};
+// Generic fallback: a raw q31 hex value formats the same way every other
+// step's value does (0-50 scale via dv()); anything else (enum/plain int)
+// is shown as-is, since it's already in a directly-readable shape.
+function formatResetValue(path, raw) {
+  const override = CHECK_FIELD_RESET_HOW[path];
+  if (override && override.format) return override.format(raw);
+  if (/^0x[0-9A-Fa-f]{8}$/.test(raw)) return dv(raw);
+  return raw;
+}
+
 function findUnexpectedChanges(result) {
   const items = [];
   for (const step of result.steps) {
     for (const f of step.fields) {
-      if (f.status === 'unexpected' && !f.key.startsWith('cable:')) items.push({ label: f.label, conceptKey: conceptForCheckKey(f.key) });
+      if (f.status === 'unexpected' && !f.key.startsWith('cable:')) {
+        const howEntry = CHECK_FIELD_RESET_HOW[f.key];
+        const resetDisplay = f.resetValue !== undefined ? formatResetValue(f.key, f.resetValue) : null;
+        items.push({
+          label: f.label,
+          conceptKey: conceptForCheckKey(f.key),
+          resetDisplay,
+          how: howEntry ? howEntry.how : 'via the SOUND menu',
+        });
+      }
     }
   }
   const targetCables = cablesOf(result.targetObj);
@@ -3892,7 +4778,7 @@ function findUnexpectedChanges(result) {
   for (const c of actualCables) {
     if (!c.source || !c.destination || cableIsDefault(c)) continue;
     const inTarget = targetCables.some(t => t.source === c.source && t.destination === c.destination);
-    if (!inTarget) items.push({ label: `${humanize(c.source)} → ${humanize(c.destination)} (extra patch cable)`, conceptKey: 'modmatrix', why: cableWhyText(c.source, c.destination, dvCable(c.amount)) });
+    if (!inTarget) items.push({ label: `${humanize(c.source)} → ${destDisplayName(c.destination)} (extra patch cable)`, conceptKey: 'modmatrix', why: cableWhyText(c.source, c.destination, dvCable(c.amount)) });
   }
   return items;
 }
@@ -3909,7 +4795,14 @@ function renderUnexpectedChanges(items) {
       // renderStepFootnotes() below.
       const whyText = item.why || (showTips && item.conceptKey && PARAM_CONCEPTS[item.conceptKey] && PARAM_CONCEPTS[item.conceptKey].why);
       const note = showTips && whyText ? `<div class="unexpected-note">Did you mean to change this? ${escapeHtml(whyText)}</div>` : '';
-      return `<li>${escapeHtml(item.label)}${note}</li>`;
+      // Always shown (not gated behind "Show tips" like the why-note above)
+      // -- this is the actual fix, not an optional teaching aside. Reported
+      // as too generic without it ("OSC1 cents ist zu generisch, der user
+      // muss wissen auf welchen wert er zurückstellen muss und wie").
+      const resetLine = item.resetDisplay !== undefined && item.resetDisplay !== null
+        ? `<div class="unexpected-reset">Reset to ${val(escapeHtml(String(item.resetDisplay)))} — ${item.how}.</div>`
+        : '';
+      return `<li>${escapeHtml(item.label)}${resetLine}${note}</li>`;
     }).join('')}</ul>`;
 }
 
@@ -3998,7 +4891,7 @@ function renderGuide(item, sections) {
         saveChecked(item.id, checked);
       }
       const el = document.createElement('div');
-      el.className = 'step' + (checked[stepId] ? ' done' : '') + (checkStatus ? ` check-${checkStatus}` : '');
+      el.className = 'step' + (checked[stepId] ? ' done' : '') + (checkStatus ? ` check-${checkStatus}` : '') + (step.indent ? ' step-indent' : '');
       if (live) el.classList.toggle('step-live-waiting', checkStatus === null);
       const cb = document.createElement('input');
       cb.type = 'checkbox';
@@ -4268,6 +5161,13 @@ function countFilesRecursive(node) {
 // DEVICE_CATEGORIZE_MAX_FILES per click.
 const DEVICE_PARTIAL_READ_BYTES = 2048; // 2x READ_CHUNK_SIZE -- enough headroom for engine+osc attributes even on a file with a long multisample zone list before them.
 const DEVICE_CATEGORIZE_MAX_FILES = 200; // a real folder-full is fine; the whole SD card is not.
+// "Load N presets…" (below) deliberately has NO matching cap: it always
+// loads every candidate the label just counted, in one click -- a 40-file
+// cap here used to force repeated clicks for anything bigger than that,
+// which is exactly the "mühsam" (tedious) real-world friction it was
+// reported for. A full readFile() per file is heavier than Categorize's 2KB
+// partial reads, but the per-file progress text ("Loaded X / N…") already
+// keeps the UI honest while a big batch is still in flight.
 
 // Doubles as the onPickerNeeded callback DelugeCheck.runCheck() expects
 // (files => Promise<string|null>), since the shape matches exactly -- that
@@ -4283,6 +5183,19 @@ function showFilePickerModal(files, { deviceForCategorize } = {}) {
     // reopening the picker starts fresh since the SD card may have changed.
     const deviceCategories = new Map();
     const deviceFilters = { engine: 'all', oscSource: 'all' };
+    function filtersAreActive() { return deviceFilters.engine !== 'all' || deviceFilters.oscSource !== 'all'; }
+    // Files directly in `node` that match the current filter (or all of
+    // them, if no filter is active) and aren't already sitting in the
+    // library -- the exact set "Load this whole folder…"/"Load N
+    // presets…" both counts and actually loads, kept in one place so the
+    // button's live label (render()) and its click handler can never drift
+    // apart from each other.
+    function loadableFilesIn(node) {
+      const scoped = filtersAreActive()
+        ? node.files.filter(f => presetMatchesFilters(deviceCategories.get(f.path), deviceFilters))
+        : node.files;
+      return scoped.filter(f => !library.some(l => l.id === `deluge:${f.path}`));
+    }
 
     openModal(box => {
       const h = document.createElement('h3');
@@ -4306,10 +5219,34 @@ function showFilePickerModal(files, { deviceForCategorize } = {}) {
       // -- only built at all when the caller passed deviceForCategorize
       // (only the "Load a preset from connected Deluge…" handler does;
       // the on-device check flow's picker never sees this UI).
+      //
+      // Categorize comes BEFORE the filter chips (it's the prerequisite
+      // that makes the chips mean anything -- they start disabled, see
+      // render()'s hasCategorized check, until at least one file in the
+      // current folder actually has data). "Load this whole folder…" comes
+      // AFTER the chips instead: it's not a prerequisite for anything, and
+      // its own label/behavior actually depends on the chips' current
+      // state (see below), so it reads better positioned right under them.
       let deviceFilterBox = null;
+      let categorizeRow = null;
       let categorizeBtn = null;
       let categorizeStatus = null;
+      let loadFolderRow = null;
+      let loadFolderBtn = null;
+      let loadFolderStatus = null;
       if (deviceForCategorize) {
+        categorizeRow = document.createElement('div');
+        categorizeRow.className = 'modal-categorize-row';
+        categorizeBtn = document.createElement('button');
+        categorizeBtn.type = 'button';
+        categorizeBtn.className = 'btn-secondary modal-categorize-btn';
+        categorizeBtn.textContent = 'Categorize this folder…';
+        categorizeStatus = document.createElement('span');
+        categorizeStatus.className = 'modal-categorize-status';
+        categorizeRow.appendChild(categorizeBtn);
+        categorizeRow.appendChild(categorizeStatus);
+        box.appendChild(categorizeRow);
+
         deviceFilterBox = document.createElement('div');
         deviceFilterBox.className = 'modal-device-filters';
         deviceFilterBox.innerHTML = `
@@ -4327,21 +5264,8 @@ function showFilePickerModal(files, { deviceForCategorize } = {}) {
               <button type="button" class="filter-chip" data-group="oscSource" data-value="multisample">Multisample</button>
             </div>
           </div>
-          <p class="modal-device-filters-note">Filters only match files read below (arpeggiator/cables/sidechain aren't detectable from a short read, so those aren't offered here). Un-categorized files always show.</p>
         `;
         box.appendChild(deviceFilterBox);
-        const categorizeRow = document.createElement('div');
-        categorizeRow.className = 'modal-categorize-row';
-        categorizeBtn = document.createElement('button');
-        categorizeBtn.type = 'button';
-        categorizeBtn.className = 'btn-secondary modal-categorize-btn';
-        categorizeBtn.textContent = 'Categorize this folder…';
-        categorizeStatus = document.createElement('span');
-        categorizeStatus.className = 'modal-categorize-status';
-        categorizeRow.appendChild(categorizeBtn);
-        categorizeRow.appendChild(categorizeStatus);
-        box.appendChild(categorizeRow);
-        deviceFilterBox._categorizeRow = categorizeRow;
 
         deviceFilterBox.addEventListener('click', e => {
           const btn = e.target.closest('.filter-chip');
@@ -4377,6 +5301,66 @@ function showFilePickerModal(files, { deviceForCategorize } = {}) {
             : `Categorized all ${node.files.length} files in this folder.`;
           categorizeBtn.disabled = false;
           render();
+        });
+
+        // Loading exactly one preset at a time from a connected Deluge left
+        // Compare with nothing to compare against unless the user ALSO
+        // loaded a local folder -- this reads every preset directly under
+        // the folder currently being browsed (not recursive, same "scoped
+        // to one folder" reasoning as Categorize above) and adds them all
+        // to the library in one go, same as picking a local folder would.
+        // Below the filter chips (not above, alongside Categorize): unlike
+        // Categorize, it isn't a prerequisite for anything else in this
+        // modal, and once a filter is actually active its own label/scope
+        // changes to match the chips right above it (see render()), which
+        // reads naturally as "this button follows what the chips say".
+        loadFolderRow = document.createElement('div');
+        loadFolderRow.className = 'modal-categorize-row';
+        loadFolderBtn = document.createElement('button');
+        loadFolderBtn.type = 'button';
+        // Own class (not .modal-categorize-btn) despite identical styling --
+        // keeps this and the real Categorize button distinguishable by
+        // selector, not just by label text.
+        loadFolderBtn.className = 'btn-secondary modal-categorize-btn modal-loadfolder-btn';
+        loadFolderBtn.textContent = 'Load this whole folder…';
+        loadFolderStatus = document.createElement('span');
+        loadFolderStatus.className = 'modal-categorize-status modal-loadfolder-status';
+        loadFolderRow.appendChild(loadFolderBtn);
+        loadFolderRow.appendChild(loadFolderStatus);
+        box.appendChild(loadFolderRow);
+
+        loadFolderBtn.addEventListener('click', async () => {
+          const node = currentNode();
+          const filtered = filtersAreActive();
+          const candidates = loadableFilesIn(node);
+          if (candidates.length === 0) {
+            loadFolderStatus.textContent = filtered ? 'Every filtered preset here is already loaded.' : 'Every preset here is already loaded.';
+            return;
+          }
+          loadFolderBtn.disabled = true;
+          let done = 0, failed = 0;
+          loadFolderStatus.textContent = `Reading ${candidates.length} file${candidates.length === 1 ? '' : 's'}…`;
+          for (const f of candidates) {
+            try {
+              const buffer = await deviceForCategorize.readFile(f.path);
+              const text = new TextDecoder().decode(buffer);
+              const name = f.path.split('/').pop().replace(/\.xml$/i, '');
+              library.push({
+                id: `deluge:${f.path}`, name, pack: 'From Deluge (live)',
+                file: { text: async () => text }, rawText: text, categories: sniffCategories(text),
+              });
+            } catch (e) {
+              failed++; // keep going -- one unreadable file shouldn't abort the whole batch
+            }
+            done++;
+            loadFolderStatus.textContent = `Loaded ${done} / ${candidates.length}…`;
+          }
+          document.getElementById('libraryBody').hidden = false;
+          renderLibrary(document.getElementById('searchBox').value);
+          loadFolderStatus.textContent = `Loaded ${candidates.length - failed}${filtered ? ' filtered' : ''} preset${candidates.length - failed === 1 ? '' : 's'}. `
+            + (failed > 0 ? `${failed} failed to read.` : '');
+          loadFolderBtn.disabled = false;
+          render(); // refresh the button's own count/label now that these are in the library
         });
       }
 
@@ -4440,7 +5424,7 @@ function showFilePickerModal(files, { deviceForCategorize } = {}) {
           list.appendChild(btn);
         }
         let fileItems = node.files.slice().sort((a, b) => a.name.localeCompare(b.name));
-        const deviceFiltersActive = deviceForCategorize && (deviceFilters.engine !== 'all' || deviceFilters.oscSource !== 'all');
+        const deviceFiltersActive = deviceForCategorize && filtersAreActive();
         if (deviceFiltersActive) {
           fileItems = fileItems.filter(f => presetMatchesFilters(deviceCategories.get(f.path), deviceFilters));
         }
@@ -4495,8 +5479,31 @@ function showFilePickerModal(files, { deviceForCategorize } = {}) {
         // flattens across the whole tree, so hide it rather than let it
         // silently do nothing.
         if (deviceFilterBox) {
+          categorizeRow.hidden = !!q;
           deviceFilterBox.hidden = !!q;
-          deviceFilterBox._categorizeRow.hidden = !!q;
+          loadFolderRow.hidden = !!q;
+          if (!q) {
+            // Chips stay disabled until at least one file in THIS folder
+            // has actually been read -- before that, every file's category
+            // is unknown, so every chip would look clickable but do
+            // nothing, which reads as broken rather than "not yet".
+            const hasCategorized = currentNode().files.some(f => deviceCategories.has(f.path));
+            for (const chip of deviceFilterBox.querySelectorAll('.filter-chip')) {
+              chip.disabled = !hasCategorized;
+            }
+            // Label always states exactly how many presets a click would
+            // add right now (scoped to the active filter, if any, and
+            // excluding ones already in the library) -- previously a flat
+            // "Load this whole folder…"/"Load all filtered…" gave no idea
+            // how big that click actually was, and a 40-file cap meant
+            // sometimes it wasn't even "all" despite the label; there's no
+            // cap now, so the count is also always the true total.
+            const count = loadableFilesIn(currentNode()).length;
+            loadFolderBtn.disabled = count === 0;
+            loadFolderBtn.textContent = count === 0
+              ? 'All presets here are loaded'
+              : `Load ${count}${filtersAreActive() ? ' filtered' : ''} preset${count === 1 ? '' : 's'}…`;
+          }
         }
         if (q) {
           breadcrumb.hidden = true;

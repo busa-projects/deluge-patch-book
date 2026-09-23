@@ -62,6 +62,8 @@ window.DelugeMidiFollowModule = (function () {
 const FIELD_TO_MIDIFOLLOW_PARAM = {
   'defaultParams.oscAVolume': 'oscAVolume',
   'defaultParams.oscBVolume': 'oscBVolume',
+  'defaultParams.oscAPulseWidth': 'oscAPhaseWidth',
+  'defaultParams.oscBPulseWidth': 'oscBPhaseWidth',
   'defaultParams.noiseVolume': 'noiseVolume',
   'defaultParams.pan': 'pan',
   'defaultParams.envelope1.attack': 'env1Attack',
@@ -106,6 +108,8 @@ const FIELD_TO_MIDIFOLLOW_PARAM = {
 const LIVE_FIELD_INIT = {
   'defaultParams.oscAVolume': '0x7FFFFFFF',
   'defaultParams.oscBVolume': '0x80000000',
+  'defaultParams.oscAPulseWidth': '0x00000000',
+  'defaultParams.oscBPulseWidth': '0x00000000',
   'defaultParams.noiseVolume': '0x80000000',
   'defaultParams.pan': '0x00000000',
   'defaultParams.envelope1.attack': '0x80000000',
@@ -193,13 +197,41 @@ const DEFAULT_CC_MAP = {
   stutterRate: 20,
 };
 
-function ccToRawHex(ccValue) {
-  // Linear 0-127 (MIDI CC's 7-bit range) -> the Deluge's signed 32-bit
-  // fixed-point parameter range, same convention decoded by app.js's own
-  // signed32()/decodeQ31() (0x80000000 = -1 .. 0x7FFFFFFF = ~+1): CC 0 maps
-  // to the bottom of that range, CC 127 to the top, evenly spaced.
+// MIDI Follow's own CC<->raw conversion is NOT the same relationship as the
+// menu's own 0-50 display scale (dv()/dvHalfPrecision() in app.js) -- a
+// SEPARATE, coarser (128-step, not 51-step) one, confirmed against firmware
+// source (modulation/params/param_set.cpp/param_collection.cpp):
+//  - Every field EXCEPT pulse width: ParamCollection::knobPosToParamValue()
+//    -- given an incoming CC (already shifted by kKnobPosOffset=64 back to
+//    a -64..63 "knobPos"), raw = knobPos << 25.
+//  - Pulse width only: PatchedParamSet::knobPosToParamValue() has its own
+//    special case (only the positive half of the range is meaningful, same
+//    reason dvHalfPrecision() exists) -- raw = (knobPos + 64) << 24, which
+//    collapses to exactly `cc << 24` once knobPos = cc - 64 is substituted
+//    in. Confirmed bit-exact against the same real-hardware data point used
+//    to verify dvHalfPrecision(): PatchedParamSet::paramValueToKnobPos()'s
+//    OWN forward formula, (paramValue >> 24) - 64, applied to the real
+//    on-screen-41 raw (0x68F5C27C) plus kKnobPosOffset gives exactly
+//    CC 104, the real confirmed value.
+// An earlier version of this function used its own approximated, continuous
+// (non-quantized) formulas instead of these exact ones -- close, but not
+// bit-identical, and confirmed (via a full sweep of the generic formula
+// against dv()) to read up to 1 menu step off from the real device on
+// roughly 1 in 10 raw values, an inherent quantization gap the real
+// firmware's own asymmetric forward/reverse formulas already have (not
+// something this app introduced, and not eliminable without ignoring what
+// the real device does) -- using the *exact* firmware formulas is as close
+// as this app can get to matching what a real device does with a given CC.
+const HALF_PRECISION_FIELD_PATHS = new Set(['defaultParams.oscAPulseWidth', 'defaultParams.oscBPulseWidth']);
+function ccToRawHex(ccValue, fieldPath) {
   const clamped = Math.max(0, Math.min(127, ccValue));
-  let raw = Math.round((clamped / 127) * 0xffffffff) - 0x80000000;
+  const knobPos = clamped - 64; // kKnobPosOffset, confirmed via the pulse-width real-hardware cross-check above
+  let raw;
+  if (HALF_PRECISION_FIELD_PATHS.has(fieldPath)) {
+    raw = knobPos < 64 ? (knobPos + 64) << 24 : 0x7fffffff;
+  } else {
+    raw = knobPos < 64 ? knobPos << 25 : 0x7fffffff;
+  }
   raw = raw >>> 0; // back to an unsigned 32-bit bit pattern for hex formatting
   return '0x' + raw.toString(16).toUpperCase().padStart(8, '0');
 }
@@ -259,6 +291,15 @@ const STATUS_LABELS = {
   0x80: 'note off', 0x90: 'note on', 0xa0: 'poly aftertouch', 0xb0: 'CC',
   0xc0: 'program change', 0xd0: 'channel aftertouch', 0xe0: 'pitch bend',
 };
+
+// System real-time messages (clock/transport) are single status-only bytes
+// sent continuously during playback -- MIDI Clock (0xF8) alone goes out 24x
+// per quarter note -- and would otherwise flood the Monitor's fixed-size
+// log (LOG_CAPACITY), pushing out anything actually useful (CC, notes...)
+// within seconds. Reported directly: "ignore clock messages on monitor or
+// transport". Never touched live-value tracking either way (only 0xB0 CC
+// ever is) -- this only changes what the Monitor log records.
+const IGNORED_REALTIME_STATUS = new Set([0xf8, 0xfa, 0xfb, 0xfc]); // clock, start, continue, stop
 
 // Tracks live CC feedback for the fields FIELD_TO_MIDIFOLLOW_PARAM knows
 // about. Doesn't touch the DOM or know about guide steps -- app.js
@@ -340,6 +381,7 @@ class MidiFollowTracker {
     if (!data || data.length < 1) return;
     const status = data[0];
     if (status === 0xf0) return; // SysEx -- deluge-sysex.js's own concern, not logged here
+    if (IGNORED_REALTIME_STATUS.has(status)) return; // clock/transport -- see IGNORED_REALTIME_STATUS's own comment
     const kind = status & 0xf0;
     const channel = (status & 0x0f) + 1; // logged 1-based, matching how a MIDI channel is normally talked about
     const portName = event.target && event.target.name;
@@ -350,8 +392,10 @@ class MidiFollowTracker {
       const fieldPaths = params.flatMap(p => PARAM_TO_FIELDS[p] || []);
       entry = { cc, value, channel, portName, params, fieldPaths, label: 'CC' };
       if (fieldPaths.length) {
-        const rawHex = ccToRawHex(value);
-        for (const path of fieldPaths) this._liveValues.set(path, rawHex);
+        // Computed per path, not once for the whole CC message -- pulse
+        // width needs a different formula than every other mapped field
+        // (see ccToRawHex()'s own comment).
+        for (const path of fieldPaths) this._liveValues.set(path, ccToRawHex(value, path));
         this._listeners.forEach(fn => fn(fieldPaths));
       }
     } else {

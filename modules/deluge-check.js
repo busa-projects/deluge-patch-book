@@ -381,6 +381,59 @@ function findCable(obj, source, destination) {
 }
 
 /**
+ * Findet die EINE Cable mit source===depthSource, die die eigene
+ * Modulationstiefe der (source,destination)-Cable ihrerseits moduliert
+ * ("double mod") -- unabhängig davon, welche der zwei real vorkommenden
+ * XML-Formen benutzt wird (siehe app.js' cablesOf() für die volle
+ * Herleitung, hier dieselbe Logik dupliziert, da dieses Modul seinen
+ * eigenen, unabhängigen Parser hat):
+ *  - Modern (Firmware >=3.2.0): verschachtelt, <patchCable ...>
+ *    <depthControlledBy><patchCable source="..." amount="..."/>
+ *    ...(kann MEHR ALS EINE enthalten!)...</depthControlledBy>
+ *    </patchCable>.
+ *  - Legacy (nie neu gespeicherter alter Preset): flach, eine oder mehrere
+ *    eigenständige <patchCable source="X" destination="range" amount="Y" />,
+ *    deren Ziel NICHT über die Reihenfolge im File aufgelöst wird, sondern
+ *    global: erst wird die GANZE Cable-Liste durchsucht nach der (letzten)
+ *    mit rangeAdjustable="1" markierten Cable, danach wird JEDE
+ *    "range"-Cable (egal ob davor oder danach im File) dieser einen Cable
+ *    zugeordnet -- exakt das Verhalten des Firmware-eigenen Readers
+ *    (readPatchCablesFromFile() liest zuerst alles ein, löst erst danach in
+ *    einem separaten Schritt auf). Auf einem echten Gerätepreset
+ *    (Bod01_06-Roygbass.XML) kommt die "range"-Cable tatsächlich VOR ihrer
+ *    eigenen rangeAdjustable-Markierung im File -- eine erste Version dieser
+ *    Funktion nahm die umgekehrte Reihenfolge an und übersah das dadurch.
+ *
+ * MEHRFACH-MOD: ein anderer echter Preset (BOC01/BOD01_49-From the
+ * distance.XML) hat ZWEI "range"-Cables (source=lfo1 UND source=random),
+ * die beide auf dieselbe rangeAdjustable-Cable zeigen -- d.h. eine Cable
+ * kann von mehr als einer zweiten Quelle gleichzeitig moduliert werden.
+ * `depthSource` wählt genau diese eine aus; eine frühere Version dieser
+ * Funktion nahm implizit "höchstens eine" an und hätte hier stillschweigend
+ * nur die zuletzt gefundene zurückgegeben.
+ */
+function resolveDepthModulatorCable(obj, source, destination, depthSource) {
+  const cables = getPatchCables(obj);
+  const outer = cables.find((c) => c && c.source === source && c.destination === destination);
+  if (outer) {
+    const innerRaw = outer.depthControlledBy && outer.depthControlledBy.patchCable;
+    const innerList = innerRaw ? (Array.isArray(innerRaw) ? innerRaw : [innerRaw]) : [];
+    const match = innerList.find((i) => i && i.source === depthSource);
+    if (match) return match;
+  }
+  let rangeAdjustableTarget = null;
+  for (const c of cables) {
+    if (c && c.source && c.destination && c.destination !== "range" && c.rangeAdjustable && c.rangeAdjustable !== "0") {
+      rangeAdjustableTarget = { source: c.source, destination: c.destination };
+    }
+  }
+  if (rangeAdjustableTarget && rangeAdjustableTarget.source === source && rangeAdjustableTarget.destination === destination) {
+    return cables.find((c) => c && c.source === depthSource && c.destination === "range") || null;
+  }
+  return null;
+}
+
+/**
  * Löst ein Feld in {targetValue, actualValue, initValue} auf. Normale
  * Felder gehen über getValueAtPath(); ein `cable`-Feld (siehe cableField()
  * in app.js) sucht statt eines Pfads die passende source/destination in
@@ -402,6 +455,57 @@ function resolveFieldValues(field, targetObj, actualObj, initObj) {
         initValue: i ? "connected" : undefined,
       };
     }
+    if (mode === "polarity") {
+      // Plain string compare (valuesMatch()'s non-numeric fallback) --
+      // "bipolar"/"unipolar" was never meant to be numeric. Confirmed
+      // real, switchable and AUDIBLE via real-hardware testing; X/Y
+      // sources are excluded from ever generating this field at all (see
+      // app.js's cableHasPolarity()), since the firmware itself never
+      // lets their polarity change.
+      //
+      // <polarity> is an optional tag -- omitted on any preset saved
+      // before it existed (confirmed real: BOD01_06-Roygbass.XML, an
+      // older-format device preset, has none on any cable). Firmware's
+      // own reader (patch_cable_set.cpp readPatchCablesFromFile()) does
+      // NOT treat that as unknown: it starts from a hardcoded BIPOLAR,
+      // overridden to UNIPOLAR only for source==aftertouch, then
+      // overridden again only if the tag is actually present -- and
+      // since the firmware ALWAYS writes the tag back out on save, an
+      // "actual" (rebuilt/resaved) file will have it explicitly even
+      // when an older-format "target" file doesn't. Backfilling here the
+      // same way the firmware itself would have resolved the omitted
+      // target tag keeps that comparison meaningful instead of reading
+      // as a false mismatch (or a false match via two undefineds).
+      const defaultPolarity = (src) => (src === "aftertouch" ? "unipolar" : "bipolar");
+      return {
+        targetValue: t ? (t.polarity || defaultPolarity(source)) : undefined,
+        actualValue: a ? (a.polarity || defaultPolarity(source)) : undefined,
+        initValue: i ? (i.polarity || defaultPolarity(source)) : undefined,
+      };
+    }
+    return {
+      targetValue: t ? t.amount : undefined,
+      actualValue: a ? a.amount : undefined,
+      initValue: i ? i.amount : undefined,
+    };
+  }
+  if (field.cableDepth) {
+    const { source, destination, depthSource, mode } = field.cableDepth;
+    const t = resolveDepthModulatorCable(targetObj, source, destination, depthSource);
+    const a = resolveDepthModulatorCable(actualObj, source, destination, depthSource);
+    const i = resolveDepthModulatorCable(initObj, source, destination, depthSource);
+    if (mode === "polarity") {
+      // Same reasoning as field.cable's own "polarity" branch above -- a
+      // chained depth modulator is its own cable with its own polarity,
+      // independent of the outer connection's, and just as likely to omit
+      // an explicit <polarity> tag on an older-format preset.
+      const defaultPolarity = (src) => (src === "aftertouch" ? "unipolar" : "bipolar");
+      return {
+        targetValue: t ? (t.polarity || defaultPolarity(depthSource)) : undefined,
+        actualValue: a ? (a.polarity || defaultPolarity(depthSource)) : undefined,
+        initValue: i ? (i.polarity || defaultPolarity(depthSource)) : undefined,
+      };
+    }
     return {
       targetValue: t ? t.amount : undefined,
       actualValue: a ? a.amount : undefined,
@@ -410,6 +514,7 @@ function resolveFieldValues(field, targetObj, actualObj, initObj) {
   }
   const initValue = getValueAtPath(initObj, field.path);
   let targetValue = getValueAtPath(targetObj, field.path);
+  let actualValue = getValueAtPath(actualObj, field.path);
   // BUG FIX: a preset's XML can omit an attribute entirely when it happens
   // to match the firmware's own built-in default (some export/editing
   // tools skip writing default-valued attributes) -- leaving targetValue
@@ -420,13 +525,27 @@ function resolveFieldValues(field, targetObj, actualObj, initObj) {
   // "changed" (away from it) forever. Falling back to initValue here
   // mirrors what actually happens when the Deluge itself loads such a
   // preset (a missing attribute just means "use the default"), which is
-  // also the correct target to check against.
+  // also the correct value to check against.
+  //
+  // SECOND BUG FIX: the exact same omission can equally happen on the
+  // *actual* (on-device progress file) side -- the Deluge's own save
+  // routine is the same one either file went through, so a device state
+  // that happens to sit exactly at the firmware default can omit that
+  // attribute too. Only falling back for targetValue (as an earlier
+  // version of this function did) meant a field the user had genuinely,
+  // correctly matched -- both files omitting the SAME attribute because
+  // both are legitimately at the default -- compared a real hex/enum
+  // string (target, backfilled from init) against actualValue's bare
+  // `undefined`, which can never match. A whole-library sweep against
+  // every real preset in synths/ (self-check: read a preset back as if it
+  // were its own "device state") found this silently broke roughly a
+  // THIRD of all checkable fields across nearly the entire library --
+  // exactly the "step doesn't check out even though it's correct on the
+  // device" class of report this was found from, and clearly not scoped
+  // to any one field.
   if (targetValue === undefined) targetValue = initValue;
-  return {
-    targetValue,
-    actualValue: getValueAtPath(actualObj, field.path),
-    initValue,
-  };
+  if (actualValue === undefined) actualValue = initValue;
+  return { targetValue, actualValue, initValue };
 }
 
 // ---------------------------------------------------------------------
@@ -544,13 +663,27 @@ function fieldStatus(ok, targetIsDefault, actualIsDefault) {
  * {
  *   ...step,
  *   complete: boolean,
- *   fields: [ { key, label, ok, status } ]
+ *   fields: [ { key, label, ok, status, resetValue? } ]
  * }
  *
  * `key` bleibt drin, damit der Aufrufer (app.js) Feld-Status auf seine
  * eigenen, key-getaggten Guide-Steps zurückmappen kann (siehe ck()/cf() in
- * app.js) -- Roh-Werte (target/actual) werden trotzdem absichtlich NICHT
+ * app.js) -- Roh-Werte (target/actual) werden ansonsten absichtlich NICHT
  * zurückgegeben, siehe Modul-Kommentar oben ("soll nicht vorsagen").
+ *
+ * EINE gezielte Ausnahme: `resetValue`, nur gesetzt wenn status ===
+ * "unexpected". Per Definition (siehe fieldStatus() oben:
+ * targetIsDefault && !actualIsDefault) ist targetValue in genau diesem Fall
+ * IMMER gleich initValue -- das Feld zeigt also keinen unvollendeten
+ * Baufortschritt, sondern etwas, das komplett außerhalb des Ziel-Patches
+ * liegt und einfach nur zurückgesetzt gehört. Für so ein Feld existiert oft
+ * gar kein Guide-Step, der den nötigen Wert je erwähnt (buildGuide()
+ * erzeugt nur für Nicht-Default-Werte Steps) -- "hier ist etwas falsch"
+ * ohne "und zwar das" zu sagen, war für den Nutzer nicht aktionabel genug
+ * (real gemeldet: "OSC1 cents ist zu generisch, der user muss wissen auf
+ * welchen wert er zurückstellen muss"). Kein Spoiler fürs eigentliche
+ * Bauen des Patches -- es beschreibt nur den Init-Zustand, den es so oder
+ * so schon gäbe, wäre dieses Feld nie angefasst worden.
  *
  * @param {Array} steps
  * @param {object} targetObj  geparster Ziel-Patch (aus dem das Patchbook stammt)
@@ -570,7 +703,7 @@ function evaluateSteps(steps, targetObj, actualObj, settings) {
       // `key` doubles as the lookup app.js's ck()/cf() markers use -- for a
       // normal field it's the same string as `path`, for a cable field
       // it's cableField()'s "cable:<mode>:<source>-><destination>".
-      return { key: field.key, label: field.label, ok, status };
+      return { key: field.key, label: field.label, ok, status, resetValue: status === 'unexpected' ? initValue : undefined };
     });
     const complete = fields.every((f) => f.ok);
     return { ...step, fields, complete };
