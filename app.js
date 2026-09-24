@@ -89,6 +89,16 @@ function parseDelugeXml(xmlText) {
   // regardless of which tag name this particular file used, instead of
   // each needing its own fallback.
   if (!sound.sidechain && sound.compressor) sound.sidechain = sound.compressor;
+  // Firmware pre-June-2017 wrote `polyphonic` as a raw numeric string
+  // ("0"=auto, "2"=choke) instead of the modern name ("auto"/"poly"/
+  // "mono"/"legato"/"choke") -- confirmed via firmware source
+  // (util/functions.cpp's stringToPolyphonyMode(), both cases explicitly
+  // commented "Old firmware, pre June 2017") and against 8 real, unmodified
+  // Factory presets that still carry it (e.g. "080 House.XML"). Left
+  // un-normalized, the guide/check would show/compare the literal digit
+  // ("Polyphony: 0"), not a name the SELECT knob's menu actually has.
+  if (sound.polyphonic === '0') sound.polyphonic = 'auto';
+  else if (sound.polyphonic === '2') sound.polyphonic = 'choke';
   return sound;
 }
 
@@ -729,6 +739,30 @@ function syncLevelName(raw) {
   return String(raw);
 }
 
+// Real device XML files store sync as TWO SEPARATE attributes -- syncLevel
+// (the plain 0-9 sub-level) and syncType (0=even/straight, 10=triplet,
+// 19=dotted -- firmware's own SyncType enum values, model/sync.h) -- NOT
+// the single packed 0-27 "menu option" value syncLevelName() above expects
+// (confirmed against firmware source: LFO/Delay/Sidechain are all
+// read/written as these two independent fields, model/sound.cpp and
+// mod_controllable_audio.cpp; the packed 0-27 scheme is purely an in-
+// memory/menu-navigation encoding, never what's written to a file).
+// Confirmed real, not just theoretical: a real preset (BOC01/BOD01_34-
+// Reversed tones My 2.XML) has <delay syncLevel="8" syncType="19"/>, a
+// genuinely dotted-synced delay -- syncLevelName(delay.syncLevel) alone
+// would decode "8" as plain "32nd", silently dropping the "(dotted)"
+// qualifier a real preset actually has. Reconstructs the packed value the
+// same way firmware's own syncTypeAndLevelToMenuOption() (model/sync.cpp)
+// does: the plain level IS the packed value for the default "even" type,
+// but triplet/dotted subtract one extra step since their own numbering
+// starts at their type constant + 1 (level 1), not + 0.
+function packedSyncOption(syncLevel, syncType) {
+  const level = parseInt(syncLevel, 10);
+  const type = parseInt(syncType, 10) || 0;
+  if (!level || Number.isNaN(level)) return 0;
+  return type === 0 ? level : type + level - 1;
+}
+
 // ---------------------------------------------------------------------------
 // "Show manual reference" (manual/community reference per step) + "Show tips"
 // (why-this-matters) reference data.
@@ -1117,6 +1151,7 @@ function describeRetrigPhase(osc, label, oscNum) {
 function buildGuide(patch) {
   const sections = [];
   const dp = patch.defaultParams || {};
+  const isFm = patch.mode === 'fm';
   const push = (title, steps) => {
     const s = steps.filter(Boolean);
     if (s.length) sections.push({ title, steps: s });
@@ -1266,61 +1301,76 @@ function buildGuide(patch) {
   push('Unison', voiceSteps);
 
   // --- Filter -------------------------------------------------------
-  const filterSteps = [];
-  // Frequency/Resonance get their own step, split off from Mode: both are
-  // real MIDI-Follow-mappable params, but bundling lpfMode's enum into the
-  // same step's checkFields used to disqualify the *whole* step from ever
-  // going live (see isLiveStep()'s "one uncovered field disqualifies the
-  // whole step" rule) -- found via real-hardware testing reporting these
-  // as never showing live despite turning the actual FREQUENCY/RESONANCE
-  // knobs. Mode keeps its own inline display here (still individually
-  // check-colored via its own data-check-path span) but moves to a
-  // separate conditional step below so its file-check status doesn't
-  // silently stop being tracked.
-  if (dp.lpfFrequency && (q31Differs(dp.lpfFrequency, INIT.lpfFrequency) || (dp.lpfResonance && q31Differs(dp.lpfResonance, INIT.lpfResonance)))) {
-    const lpfMode = patch.lpfMode || INIT.lpfMode;
-    filterSteps.push(makeStep('Low-pass filter',
-      `${ck('defaultParams.lpfFrequency', `${shift('FREQUENCY')} (under LPF) to ${val(dv(dp.lpfFrequency))}`)}${dp.lpfResonance ? `. ${ck('defaultParams.lpfResonance', `${shift('RESONANCE')} to ${val(dv(dp.lpfResonance))}`)}` : ''}.`,
-      `LPF (${ck('lpfMode', val(lpfMode))}) ${ck('defaultParams.lpfFrequency', `cutoff ${val(rawPct(dp.lpfFrequency) + '%')}`)}, ${ck('defaultParams.lpfResonance', `resonance ${val(dp.lpfResonance ? rawPct(dp.lpfResonance) + '%' : '0%')}`)}.`,
-      [cf('defaultParams.lpfFrequency', 'Freq'), cf('defaultParams.lpfResonance', 'Res')],
-      { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (LPF)', 89), conceptKey: 'filter.lpf' }));
+  // FM mode has no filter at all -- confirmed via firmware source
+  // (processing/sound/sound.cpp's readFromFile(): "old FM patches can have
+  // a filter mode saved in them even though it wouldn't have rendered at
+  // the time"). That stale lpfMode/hpfMode data isn't just cosmetically
+  // wrong when the patch predates some firmware version -- it's NEVER
+  // relevant for FM, on any firmware, since the filter section never
+  // applies to this engine at all. Found on a real preset ("Fmbd.XML"):
+  // lpfMode="flanger" (not even a real filter-slope value, apparently a
+  // stray leftover from mod-fx state) produced a guide step reading
+  // "cycle the filter slope to FLANGER" -- nonsensical on hardware that
+  // has no LPF menu to even find in FM mode. Skips the whole section
+  // rather than only the Mode steps, since Frequency/Resonance are
+  // equally irrelevant here regardless of what their own stale values say.
+  if (!isFm) {
+    const filterSteps = [];
+    // Frequency/Resonance get their own step, split off from Mode: both are
+    // real MIDI-Follow-mappable params, but bundling lpfMode's enum into the
+    // same step's checkFields used to disqualify the *whole* step from ever
+    // going live (see isLiveStep()'s "one uncovered field disqualifies the
+    // whole step" rule) -- found via real-hardware testing reporting these
+    // as never showing live despite turning the actual FREQUENCY/RESONANCE
+    // knobs. Mode keeps its own inline display here (still individually
+    // check-colored via its own data-check-path span) but moves to a
+    // separate conditional step below so its file-check status doesn't
+    // silently stop being tracked.
+    if (dp.lpfFrequency && (q31Differs(dp.lpfFrequency, INIT.lpfFrequency) || (dp.lpfResonance && q31Differs(dp.lpfResonance, INIT.lpfResonance)))) {
+      const lpfMode = patch.lpfMode || INIT.lpfMode;
+      filterSteps.push(makeStep('Low-pass filter',
+        `${ck('defaultParams.lpfFrequency', `${shift('FREQUENCY')} (under LPF) to ${val(dv(dp.lpfFrequency))}`)}${dp.lpfResonance ? `. ${ck('defaultParams.lpfResonance', `${shift('RESONANCE')} to ${val(dv(dp.lpfResonance))}`)}` : ''}.`,
+        `LPF (${ck('lpfMode', val(lpfMode))}) ${ck('defaultParams.lpfFrequency', `cutoff ${val(rawPct(dp.lpfFrequency) + '%')}`)}, ${ck('defaultParams.lpfResonance', `resonance ${val(dp.lpfResonance ? rawPct(dp.lpfResonance) + '%' : '0%')}`)}.`,
+        [cf('defaultParams.lpfFrequency', 'Freq'), cf('defaultParams.lpfResonance', 'Res')],
+        { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (LPF)', 89), conceptKey: 'filter.lpf' }));
+    }
+    const lpfModeNow = patch.lpfMode || INIT.lpfMode;
+    if (plainDiffers(lpfModeNow, INIT.lpfMode)) {
+      filterSteps.push(makeStep('Low-pass filter mode',
+        `${ck('lpfMode', `${shift('DB/OCT')} (under LPF) to cycle the filter slope to ${val(lpfModeNow)}`)}.`,
+        `LPF mode: ${ck('lpfMode', val(lpfModeNow))}.`,
+        [cf('lpfMode', 'Mode')],
+        { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (LPF)', 89), conceptKey: 'filter.lpf' }));
+    }
+    if (dp.hpfFrequency && q31Differs(dp.hpfFrequency, INIT.hpfFrequency)) {
+      const hpfMode = patch.hpfMode || INIT.hpfMode;
+      filterSteps.push(makeStep('High-pass filter',
+        `${ck('defaultParams.hpfFrequency', `${shift('FREQUENCY')} (under HPF) to ${val(dv(dp.hpfFrequency))}`)}${dp.hpfResonance ? `. ${ck('defaultParams.hpfResonance', `${shift('RESONANCE')} to ${val(dv(dp.hpfResonance))}`)}` : ''}.`,
+        `HPF (${ck('hpfMode', val(hpfMode))}) ${ck('defaultParams.hpfFrequency', `cutoff ${val(rawPct(dp.hpfFrequency) + '%')}`)}.`,
+        [cf('defaultParams.hpfFrequency', 'Freq'), cf('defaultParams.hpfResonance', 'Res')],
+        { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (HPF)', 89), conceptKey: 'filter.hpf' }));
+    }
+    const hpfModeNow = patch.hpfMode || INIT.hpfMode;
+    if (plainDiffers(hpfModeNow, INIT.hpfMode)) {
+      filterSteps.push(makeStep('High-pass filter mode',
+        `${ck('hpfMode', `HPF type to ${val(hpfModeNow)} via the SOUND menu (${selectMenu('HPF &gt; MODE')}; no dedicated shortcut pad)`)}.`,
+        `HPF mode: ${ck('hpfMode', val(hpfModeNow))}.`,
+        [cf('hpfMode', 'Mode')],
+        { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (HPF)', 89), conceptKey: 'filter.hpf' }));
+    }
+    if (patch.filterRoute && patch.filterRoute !== INIT.filterRoute) {
+      filterSteps.push(makeStep('Filter routing',
+        `${ck('filterRoute', `${selectMenu('SOUND &gt; FILTER ROUTE')} set to ${val(patch.filterRoute)}`)}.`,
+        `${ck('filterRoute', `Filter route: ${val(patch.filterRoute)}`)}.`,
+        [cf('filterRoute', 'Route')],
+        // Confirmed via grep: no "FILTER ROUTE"/"Parallel" mention anywhere in
+        // the official manual text, but community_features.txt documents it
+        // explicitly ("FILTER ROUTE is accessible via the SOUND menu only...")
+        // under its "4.2.1 - Filters" heading.
+        { manualRef: communityRef('§4.2.1 "Filters" (Filter Route)', '421---filters'), conceptKey: 'filter.route' }));
+    }
+    push('Filter', filterSteps);
   }
-  const lpfModeNow = patch.lpfMode || INIT.lpfMode;
-  if (plainDiffers(lpfModeNow, INIT.lpfMode)) {
-    filterSteps.push(makeStep('Low-pass filter mode',
-      `${ck('lpfMode', `${shift('DB/OCT')} (under LPF) to cycle the filter slope to ${val(lpfModeNow)}`)}.`,
-      `LPF mode: ${ck('lpfMode', val(lpfModeNow))}.`,
-      [cf('lpfMode', 'Mode')],
-      { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (LPF)', 89), conceptKey: 'filter.lpf' }));
-  }
-  if (dp.hpfFrequency && q31Differs(dp.hpfFrequency, INIT.hpfFrequency)) {
-    const hpfMode = patch.hpfMode || INIT.hpfMode;
-    filterSteps.push(makeStep('High-pass filter',
-      `${ck('defaultParams.hpfFrequency', `${shift('FREQUENCY')} (under HPF) to ${val(dv(dp.hpfFrequency))}`)}${dp.hpfResonance ? `. ${ck('defaultParams.hpfResonance', `${shift('RESONANCE')} to ${val(dv(dp.hpfResonance))}`)}` : ''}.`,
-      `HPF (${ck('hpfMode', val(hpfMode))}) ${ck('defaultParams.hpfFrequency', `cutoff ${val(rawPct(dp.hpfFrequency) + '%')}`)}.`,
-      [cf('defaultParams.hpfFrequency', 'Freq'), cf('defaultParams.hpfResonance', 'Res')],
-      { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (HPF)', 89), conceptKey: 'filter.hpf' }));
-  }
-  const hpfModeNow = patch.hpfMode || INIT.hpfMode;
-  if (plainDiffers(hpfModeNow, INIT.hpfMode)) {
-    filterSteps.push(makeStep('High-pass filter mode',
-      `${ck('hpfMode', `HPF type to ${val(hpfModeNow)} via the SOUND menu (${selectMenu('HPF &gt; MODE')}; no dedicated shortcut pad)`)}.`,
-      `HPF mode: ${ck('hpfMode', val(hpfModeNow))}.`,
-      [cf('hpfMode', 'Mode')],
-      { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (HPF)', 89), conceptKey: 'filter.hpf' }));
-  }
-  if (patch.filterRoute && patch.filterRoute !== INIT.filterRoute) {
-    filterSteps.push(makeStep('Filter routing',
-      `${ck('filterRoute', `${selectMenu('SOUND &gt; FILTER ROUTE')} set to ${val(patch.filterRoute)}`)}.`,
-      `${ck('filterRoute', `Filter route: ${val(patch.filterRoute)}`)}.`,
-      [cf('filterRoute', 'Route')],
-      // Confirmed via grep: no "FILTER ROUTE"/"Parallel" mention anywhere in
-      // the official manual text, but community_features.txt documents it
-      // explicitly ("FILTER ROUTE is accessible via the SOUND menu only...")
-      // under its "4.2.1 - Filters" heading.
-      { manualRef: communityRef('§4.2.1 "Filters" (Filter Route)', '421---filters'), conceptKey: 'filter.route' }));
-  }
-  push('Filter', filterSteps);
 
   // --- Envelopes ----------------------------------------------------
   function envStep(env, initEnv, label, envNum) {
@@ -1369,8 +1419,8 @@ function buildGuide(patch) {
     // split. Reported directly against real hardware: "lfo rate also"
     // [should be live].
     lfoSteps.push(makeStep(`LFO ${n}`,
-      `${ck(`lfo${n}.type`, `${shift(`LFO${n} SHAPE`)} to ${val(lfo.type || 'triangle')}`)}${lfo.syncLevel && lfo.syncLevel !== '0' ? `. ${ck(`lfo${n}.syncLevel`, `${shift(`LFO${n} SYNC`)} to ${val(syncLevelName(lfo.syncLevel))}`)}` : ''}.`,
-      `${ck(`lfo${n}.type`, `LFO${n}: ${val(lfo.type || 'triangle')} wave`)}${lfo.syncLevel && lfo.syncLevel !== '0' ? `, ${ck(`lfo${n}.syncLevel`, `synced to ${val(syncLevelName(lfo.syncLevel))}`)}` : ''}.`,
+      `${ck(`lfo${n}.type`, `${shift(`LFO${n} SHAPE`)} to ${val(lfo.type || 'triangle')}`)}${lfo.syncLevel && lfo.syncLevel !== '0' ? `. ${ck(`lfo${n}.syncLevel`, `${shift(`LFO${n} SYNC`)} to ${val(syncLevelName(packedSyncOption(lfo.syncLevel, lfo.syncType)))}`)}` : ''}.`,
+      `${ck(`lfo${n}.type`, `LFO${n}: ${val(lfo.type || 'triangle')} wave`)}${lfo.syncLevel && lfo.syncLevel !== '0' ? `, ${ck(`lfo${n}.syncLevel`, `synced to ${val(syncLevelName(packedSyncOption(lfo.syncLevel, lfo.syncType)))}`)}` : ''}.`,
       // buildCheckSteps() only covers lfo1/lfo2 -- no check field for lfo3/lfo4.
       (n === 1 || n === 2)
         ? [cf(`lfo${n}.type`, 'Shape'), cf(`lfo${n}.syncLevel`, 'Sync')]
@@ -1624,11 +1674,11 @@ function buildGuide(patch) {
     const beginnerParts = [
       delayPingPongOn && ck('delay.pingPong', `${shift('PINGPONG')} on`),
       delayAnalogOn && ck('delay.analog', `${shift('TYPE')} to ${val('ANALOG')}`),
-      delaySyncChanged && ck('delay.syncLevel', `${shift('SYNC')} to ${val(syncLevelName(delay.syncLevel))}`),
+      delaySyncChanged && ck('delay.syncLevel', `${shift('SYNC')} to ${val(syncLevelName(packedSyncOption(delay.syncLevel, delay.syncType)))}`),
     ].filter(Boolean);
     const expertParts = [
       delayPingPongOn && ck('delay.pingPong', 'ping-pong'),
-      delaySyncChanged && ck('delay.syncLevel', `synced to ${val(syncLevelName(delay.syncLevel))}`),
+      delaySyncChanged && ck('delay.syncLevel', `synced to ${val(syncLevelName(packedSyncOption(delay.syncLevel, delay.syncType)))}`),
     ].filter(Boolean);
     fxSteps.push(makeStep('Delay settings',
       `${beginnerParts.join('. ')}.`,
@@ -1649,7 +1699,7 @@ function buildGuide(patch) {
   const sc = patch.sidechain;
   if (sc && (plainDiffers(sc.attack, INIT.sidechain.attack) || plainDiffers(sc.release, INIT.sidechain.release) || plainDiffers(sc.syncLevel, INIT.sidechain.syncLevel))) {
     push('Sidechain compressor', [makeStep('Ducking envelope',
-      `${ck('sidechain.attack', shift('ATTACK'))} and ${ck('sidechain.release', shift('RELEASE'))} (under SIDECHAIN COMPRESSOR) to ${ck('sidechain.attack', `attack ${val(sc.attack)}`)}, ${ck('sidechain.release', `release ${val(sc.release)}`)}${sc.syncLevel && sc.syncLevel !== '0' ? `. ${ck('sidechain.syncLevel', `${shift('SYNC')} to ${val(syncLevelName(sc.syncLevel))}`)}` : ''}.`,
+      `${ck('sidechain.attack', shift('ATTACK'))} and ${ck('sidechain.release', shift('RELEASE'))} (under SIDECHAIN COMPRESSOR) to ${ck('sidechain.attack', `attack ${val(sc.attack)}`)}, ${ck('sidechain.release', `release ${val(sc.release)}`)}${sc.syncLevel && sc.syncLevel !== '0' ? `. ${ck('sidechain.syncLevel', `${shift('SYNC')} to ${val(syncLevelName(packedSyncOption(sc.syncLevel, sc.syncType)))}`)}` : ''}.`,
       `Sidechain compressor: ${ck('sidechain.attack', `attack ${val(sc.attack)}`)}, ${ck('sidechain.release', `release ${val(sc.release)}`)}.`,
       [cf('sidechain.attack', 'Attack'), cf('sidechain.release', 'Release'), cf('sidechain.syncLevel', 'Sync')],
       { manualRef: manualRef('§6.4 "Sidechain Compressor"', 133), conceptKey: 'sidechain' })]);
@@ -1889,7 +1939,10 @@ function buildCheckSteps(patch) {
         intField('Spread', 'unison.spread', CHECK_UNISON_RANGE),
         field('Portamento', 'defaultParams.portamento'),
       ] },
-    { id: 'filter', label: 'Filter', fields: [
+    // FM mode has no filter at all -- see buildGuide()'s own comment (real
+    // preset "Fmbd.XML": lpfMode="flanger", a stale, never-rendered value
+    // that would otherwise show as a bogus "changed" filter mismatch here).
+    { id: 'filter', label: 'Filter', fields: isFm ? [] : [
         field('LPF frequency', 'defaultParams.lpfFrequency'),
         field('LPF resonance', 'defaultParams.lpfResonance'),
         field('LPF mode', 'lpfMode'),

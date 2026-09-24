@@ -113,13 +113,32 @@ function elementToObject(el) {
  * gefolgt von Müll, was DOMParser als "Extra content at the end of the
  * document" ablehnt. Wir schneiden daher alles nach dem schliessenden Tag
  * des Wurzelelements ab, bevor wir parsen.
+ *
+ * Ein zweites, unabhängiges Problem betrifft SEHR alte Presets (Firmware
+ * <3.0, "2.0.0-beta"-Ära -- reale, unveränderte Werksdateien, nicht nur
+ * BOD01-artige neuere): <firmwareVersion>/<earliestCompatibleFirmware>
+ * stehen dort als GESCHWISTER-Elemente VOR <sound>, nicht als Attribut
+ * AUF <sound> wie bei neueren Dateien -- kein gültiges XML mit genau
+ * einem Wurzelelement. Die ursprüngliche, generische "nimm das ERSTE Tag,
+ * schneide bei DESSEN schliessendem Tag ab"-Logik traf dabei auf
+ * <firmwareVersion> statt auf <sound> und verwarf damit die GESAMTE
+ * restliche Datei (<sound> und alles darin) VOR dem Parsen -- jedes Feld
+ * las sich danach als "in der Datei fehlend" und fiel auf seinen eigenen
+ * Init-Default zurück, für buchstäblich jedes von diesem Modul geprüfte
+ * Feld (real gemeldet, live UND file-basiert: "not only for adsr also for
+ * noise level... same for all factory presets... loading bod01 patches,
+ * everything works"). app.js's eigener Parser (parseDelugeXml() dort) hat
+ * genau dieses Problem schon lange gelöst -- dieselbe Lösung hier
+ * übernommen, statt sie ein zweites Mal separat zu erfinden: gezielt nach
+ * <sound (nicht "irgendein erstes Tag") und dessen EIGENEM schliessenden
+ * Tag suchen, per lastIndexOf (nicht die erste Fundstelle danach) genau
+ * wie dort.
  */
 function extractFirstXmlDocument(xmlText) {
-  const openMatch = xmlText.match(/<([a-zA-Z_][\w.-]*)\b/);
-  if (!openMatch) return xmlText;
-  const closeTag = `</${openMatch[1]}>`;
-  const closeIdx = xmlText.indexOf(closeTag, openMatch.index);
-  return closeIdx === -1 ? xmlText : xmlText.slice(0, closeIdx + closeTag.length);
+  const start = xmlText.indexOf('<sound');
+  const end = xmlText.lastIndexOf('</sound>');
+  if (start === -1 || end === -1) return xmlText;
+  return xmlText.slice(start, end + '</sound>'.length);
 }
 
 /** Parst einen Deluge-Patch-XML-String in ein einfaches JS-Objekt. */
@@ -139,6 +158,34 @@ function parseDelugeXml(xmlText) {
   // compare a sidechain value against a target/actual file that used the
   // older tag name.
   if (!obj.sidechain && obj.compressor) obj.sidechain = obj.compressor;
+  // Envelope1/2 can appear EITHER as a top-level sibling of <defaultParams>
+  // OR nested inside it -- both real, confirmed shapes (see app.js's own
+  // envStep()/etc.: "patch.envelope1 || get(dp, 'envelope1')", the exact
+  // same defensive fallback, needed for the exact same reason). Every
+  // field path in THIS module assumes the nested shape
+  // ("defaultParams.envelope1.attack", both FIELD_TO_MIDIFOLLOW_PARAM and
+  // buildCheckSteps()'s own env1/env2 fields), so a preset using the
+  // top-level shape silently made getValueAtPath() return undefined for
+  // its REAL envelope values -- falling through to the "field omitted"
+  // init default for BOTH the file-based Check Now flow and MIDI-Follow
+  // live tracking (both resolve paths against this same parsed object).
+  // Reported directly against real hardware, live: a preset's envelope1
+  // read as a false "ok" (green) before any knob was touched (both target
+  // and live were silently being compared as "init" against "init"), then
+  // flipped to "unexpected" (red, wrong-direction arrows) once correctly
+  // dialled in to its real, non-default target (now comparing the real,
+  // non-default live value against the same wrongly-init'd "target").
+  obj.defaultParams = obj.defaultParams || {};
+  if (!obj.defaultParams.envelope1 && obj.envelope1) obj.defaultParams.envelope1 = obj.envelope1;
+  if (!obj.defaultParams.envelope2 && obj.envelope2) obj.defaultParams.envelope2 = obj.envelope2;
+  // Same pre-June-2017 numeric `polyphonic` drift app.js's own parser
+  // normalizes ("0"->auto, "2"->choke, firmware source: util/functions.cpp
+  // stringToPolyphonyMode()) -- normalize here too so buildCheckSteps()'s
+  // "General"/Polyphony field compares the real name on both sides
+  // consistently, not a raw digit that would never match a modern file's
+  // own name-based value.
+  if (obj.polyphonic === '0') obj.polyphonic = 'auto';
+  else if (obj.polyphonic === '2') obj.polyphonic = 'choke';
   return obj;
 }
 
