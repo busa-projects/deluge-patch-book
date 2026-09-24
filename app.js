@@ -275,6 +275,7 @@ const INIT = {
   arpMode: 'off',
   arpeggiatorRate: '0x00000000',
   arpeggiatorGate: '0x00000000',
+  arpSyncLevel: '7',
   modulatorAmount: '0x80000000',
   clippingAmount: '0',
   bitCrush: '0x80000000',
@@ -763,6 +764,50 @@ function packedSyncOption(syncLevel, syncType) {
   return type === 0 ? level : type + level - 1;
 }
 
+// Is the arpeggiator on at all -- confirmed via firmware source
+// (modulation/arpeggiator.cpp's own file reader): `arpMode` (when present)
+// is the CURRENT firmware's sole on/off flag; the older `mode` attribute is
+// only ever consulted for files older than community firmware 1.1.0 (and
+// even then only if noteMode/octaveMode are still at their class defaults),
+// so for any reasonably modern file `arpMode` is authoritative and `mode`
+// is pure write-time backward-compat filler. Falls back to `mode` only when
+// `arpMode` is absent entirely (a genuinely pre-split file, which never had
+// noteMode/octaveMode to disagree with `mode` in the first place).
+function arpModeOn(arp) {
+  if (!arp) return false;
+  const raw = arp.arpMode !== undefined ? arp.arpMode : arp.mode;
+  return !!raw && raw !== 'off';
+}
+
+// The friendly preset name shown on the real device's own MODE shortcut pad
+// (gui/menu_item/arpeggiator/preset_mode.h's PresetMode) is NOT what's
+// stored in the file for a modern preset -- confirmed via firmware source:
+// current firmware's `mode`/`arpMode` attributes are only ever "off" or
+// "arp" (a plain on/off flag; the old up/down/both/random vocabulary was
+// retired when noteMode+octaveMode were split out), so displaying
+// arp.mode.toUpperCase() directly showed the literal, useless text "ARP"
+// for every real modern preset with the arp enabled (confirmed: of 112 real
+// files with both `mode` and `arpMode`, 111 have `mode` already reduced to
+// "arp"/"off" too, not a pattern name) -- reported directly ("Arp mode ist
+// auch daneben"). Reconstructs the same preset firmware would show by
+// reversing its own ArpeggiatorSettings::updatePresetFromCurrentSettings().
+// A pre-split file (no arpMode at all) instead has its ONE legacy `mode`
+// attribute already carry the preset name directly (up/down/both/random),
+// confirmed firmware-equivalent via oldModeToArpNoteMode()/
+// oldModeToArpOctaveMode() reducing back to exactly those same 4 presets.
+function arpPresetName(arp) {
+  if (!arpModeOn(arp)) return 'OFF';
+  if (arp.arpMode === undefined) return arp.mode.toUpperCase();
+  const noteMode = arp.noteMode || 'up';
+  const octaveMode = arp.octaveMode || 'up';
+  if (octaveMode === 'up' && noteMode === 'up') return 'UP';
+  if (octaveMode === 'down' && noteMode === 'down') return 'DOWN';
+  if (octaveMode === 'alt' && noteMode === 'up') return 'BOTH';
+  if (octaveMode === 'random' && noteMode === 'random') return 'RANDOM';
+  if (octaveMode === 'alt' && noteMode === 'walk2') return 'WALK';
+  return 'CUSTOM';
+}
+
 // ---------------------------------------------------------------------------
 // "Show manual reference" (manual/community reference per step) + "Show tips"
 // (why-this-matters) reference data.
@@ -1178,6 +1223,21 @@ function buildGuide(patch) {
           [cf('polyphonic', 'Polyphony')],
           { manualRef: manualRef('§4.11 "Deluge Voices" (Setting the Synth Polyphony)', 105) })
       : null,
+    // Confirmed real via firmware source (gui/menu_item/master_transpose.h)
+    // and the real preset corpus (58 files with a genuine non-zero value,
+    // e.g. Factory/070 Glockenspiel.XML=12, Factory/146 Atmospheric Squares
+    // Pad.XML=-8) -- this is the WHOLE-PATCH transpose (Sound::transpose),
+    // separate from OSC1/OSC2's own per-oscillator transpose steps below.
+    // Reported directly against real hardware: SHIFT+XPOSE, in the MASTER
+    // section -- corrects an earlier, wrong assumption (drawn from the
+    // shortcut-pad grid in firmware source alone) that there was no
+    // dedicated pad for this.
+    (patch.transpose && patch.transpose !== '0')
+      ? makeStep('Master transpose',
+          `${ck('transpose', `${shift('XPOSE')} (under MASTER) to ${val(patch.transpose)} semitones${patch.cents && patch.cents !== '0' ? ` (${val(patch.cents)} cents fine-tune)` : ''}`)}.`,
+          `Master transpose: ${ck('transpose', val(patch.transpose + ' st'))}${patch.cents && patch.cents !== '0' ? `, ${ck('cents', val(patch.cents + ' cents'))} fine-tune` : ''}.`,
+          [cf('transpose', 'Transpose'), cf('cents', 'Cents')])
+      : null,
   ]);
 
   // --- Oscillators ------------------------------------------------------
@@ -1591,11 +1651,39 @@ function buildGuide(patch) {
   // --- Arpeggiator ----------------------------------------------------
   const arp = patch.arpeggiator;
   const arpSteps = [];
-  if (arp && arp.mode && arp.mode !== 'off') {
+  if (arpModeOn(arp)) {
+    const presetName = arpPresetName(arp);
+    // Checked fields cover BOTH the plain on/off flag (arpeggiator.mode --
+    // always present, even on a pre-split file) AND, for a modern file, the
+    // real noteMode/octaveMode pair the displayed preset name is derived
+    // from -- the on/off flag alone can't distinguish e.g. UP from DOWN, so
+    // checking only `mode` (which is just "arp" for any modern on preset)
+    // would never flag a real pattern mismatch.
+    const modeCheckFields = arp.arpMode !== undefined
+      ? [cf('arpeggiator.mode', 'Mode'), cf('arpeggiator.noteMode', 'Note mode'), cf('arpeggiator.octaveMode', 'Octave mode')]
+      : [cf('arpeggiator.mode', 'Mode')];
     arpSteps.push(makeStep('Enable arpeggiator',
-      `${ck('arpeggiator.mode', `${shift('MODE')} (under VOICE) to ${val(arp.mode.toUpperCase())}`)}${arp.numOctaves ? `. ${ck('arpeggiator.numOctaves', `${shift('NUMBER OF OCTAVES')} to ${val(arp.numOctaves)}`)}` : ''}.`,
-      `${ck('arpeggiator.mode', `Arpeggiator: ${val(arp.mode)} mode`)}${arp.numOctaves ? `, ${ck('arpeggiator.numOctaves', `${arp.numOctaves} octave(s)`)}` : ''}.`,
-      [cf('arpeggiator.mode', 'Mode'), cf('arpeggiator.numOctaves', 'Octaves')],
+      `${ck('arpeggiator.mode', `${shift('MODE')} (under VOICE) to ${val(presetName)}`)}${arp.numOctaves ? `. ${ck('arpeggiator.numOctaves', `${shift('NUMBER OF OCTAVES')} to ${val(arp.numOctaves)}`)}` : ''}.`,
+      `${ck('arpeggiator.mode', `Arpeggiator: ${val(presetName)} mode`)}${arp.numOctaves ? `, ${ck('arpeggiator.numOctaves', `${arp.numOctaves} octave(s)`)}` : ''}.`,
+      [...modeCheckFields, cf('arpeggiator.numOctaves', 'Octaves')],
+      { manualRef: manualRef('§4.12 "Arpeggiator"', 108), conceptKey: 'arpeggiator' }));
+  }
+  // Sync gets its own step, same reasoning as LFO/Delay/Sidechain sync
+  // (see syncLevelName()'s own comment) -- and the SAME real bug class
+  // already fixed there: gating on syncLevel alone misses a syncType-only
+  // (triplet/dotted) change. Confirmed real encoding via firmware source
+  // (gui/menu_item/arpeggiator/sync.h's Sync menu item calls the exact same
+  // syncTypeAndLevelToMenuOption()/syncValueToSyncLevel() firmware
+  // functions LFO/Delay/Sidechain use) -- packedSyncOption()/
+  // syncLevelName() apply unchanged. INIT default confirmed via the real
+  // corpus: syncLevel="7" (syncType absent/0) on ~1720 of ~1830 real files
+  // with an <arpeggiator> element, by far the most common value.
+  const arpSyncChanged = arp && (plainDiffers(arp.syncLevel, INIT.arpSyncLevel) || (arp.syncType && arp.syncType !== '0'));
+  if (arpSyncChanged) {
+    arpSteps.push(makeStep('Arpeggiator sync',
+      `${ck('arpeggiator.syncLevel', `${shift('SYNC')} (under VOICE) to ${val(syncLevelName(packedSyncOption(arp.syncLevel, arp.syncType)))}`)}.`,
+      `Arpeggiator ${ck('arpeggiator.syncLevel', `synced to ${val(syncLevelName(packedSyncOption(arp.syncLevel, arp.syncType)))}`)}.`,
+      [cf('arpeggiator.syncLevel', 'Sync')],
       { manualRef: manualRef('§4.12 "Arpeggiator"', 108), conceptKey: 'arpeggiator' }));
   }
   // Rate/Gate get their own step, independent of whether the arp is
@@ -1904,6 +1992,8 @@ function buildCheckSteps(patch) {
     { id: 'general', label: 'General', fields: [
         field('Synth mode', 'mode'),
         field('Polyphony', 'polyphonic'),
+        field('Master transpose', 'transpose'),
+        field('Master cents', 'cents'),
       ] },
     { id: 'osc', label: 'Oscillators', fields: isFm ? [
         field('Carrier 1 transpose', 'osc1.transpose'),
@@ -1965,7 +2055,10 @@ function buildCheckSteps(patch) {
       ] },
     { id: 'arp', label: 'Arpeggiator', fields: [
         field('Arp mode', 'arpeggiator.mode'),
+        field('Arp note mode', 'arpeggiator.noteMode'),
+        field('Arp octave mode', 'arpeggiator.octaveMode'),
         intField('Arp octaves', 'arpeggiator.numOctaves'),
+        intField('Arp sync level', 'arpeggiator.syncLevel', CHECK_SYNC_LEVEL_RANGE),
         field('Arp gate', 'defaultParams.arpeggiatorGate'),
         field('Arp rate', 'defaultParams.arpeggiatorRate'),
       ] },
@@ -2279,7 +2372,7 @@ function buildSignalPathSvg(patch, idPrefix) {
   const delayOn = dp.delayFeedback && q31Differs(dp.delayFeedback, INIT.delayFeedback);
   const reverbOn = dp.reverbAmount && q31Differs(dp.reverbAmount, INIT.reverbAmount);
   const arp = patch.arpeggiator;
-  const arpOn = arp && arp.mode && arp.mode !== 'off';
+  const arpOn = arpModeOn(arp);
   const uni = patch.unison;
   const uniOn = uni && parseInt(uni.num, 10) > 1;
   const sc = patch.sidechain;
@@ -2408,7 +2501,7 @@ function buildSignalPathSvg(patch, idPrefix) {
     // hidden behind MOD1's box, making it look like a second, separate line
     // meets CARRIER1 from above (right where MOD1's own real arrow does).
     const arpTarget = isFm ? mod1 : sources[0];
-    const arpBox = place(sdBox(arpTarget.left, 4, 90, 40, 'ARP', arp.mode, 'changed'));
+    const arpBox = place(sdBox(arpTarget.left, 4, 90, 40, 'ARP', arpPresetName(arp), 'changed'));
     arrows.push(sdArrow(arpBox.cx, arpBox.bottom, arpTarget.cx, arpTarget.top, true));
   }
 
@@ -2877,7 +2970,10 @@ function userGuideSections() {
       every click after just re-reads it. Steps color themselves automatically: green once a
       value is a perfect match, yellow if you've changed it but it's not there yet, red if you
       changed something this preset doesn't actually use. <b>Check settings</b> loosens or
-      tightens how exact a match needs to be.</p>` },
+      tightens how exact a match needs to be. The first time EVERY field matches at once, that
+      preset gets a &#9733; in the library list for good &mdash; a permanent record that it CAN
+      be built correctly, independent of whatever the Deluge's own song happens to look like the
+      next time you open it.</p>` },
     { title: 'Live updates (MIDI Follow)', body: `
       <p>Needs enabling <b>on the Deluge itself</b> first: <b>SETTINGS &rarr; MIDI &rarr;
       MIDI-FOLLOW &rarr; FEEDBACK &rarr; CHANNEL</b> must be set to an actual channel, not OFF.
@@ -4404,8 +4500,7 @@ function renderLibrary(filterText) {
       const el = document.createElement('div');
       el.className = 'preset-item';
       if (currentPreset && currentPreset.id === item.id) el.classList.add('active');
-      const progress = getProgress(item.id);
-      el.innerHTML = item.name + (progress && progress.total ? `<span class="done-badge">${progress.done}/${progress.total}</span>` : '');
+      el.innerHTML = item.name + (isCompleted(item.id) ? `<span class="done-badge" title="Fully built correctly at least once (Check now matched every field)">&starf;</span>` : '');
       el.addEventListener('click', () => selectPreset(item));
       list.appendChild(el);
     }
@@ -4446,21 +4541,29 @@ async function selectPreset(item) {
 }
 
 // ---------------------------------------------------------------------------
-// Progress persistence (per-preset checklist state, kept in localStorage)
+// "Fully built" marker (one star per preset, kept in localStorage)
 // ---------------------------------------------------------------------------
-function progressKey(id) { return `delugePatchBook:progress:${id}`; }
-function loadChecked(id) {
-  try { return JSON.parse(localStorage.getItem(progressKey(id)) || '{}'); }
-  catch (e) { return {}; }
+// Per-step progress ticking used to persist here too, but that state never
+// reliably means anything the next time the guide is opened: the actual
+// song/patch on the Deluge moves on independently of this app between
+// sessions, so "step 4 was ticked last time" says nothing trustworthy about
+// what's on the device NOW. Reported directly ("ich würde den progress
+// wegnehmen, da das setup mit dem song auf dem deluge dann eh nie stimmt").
+// Replaced with one durable, one-way fact per preset instead of dozens of
+// stale per-step ones: has a full Check now EVER found every single field
+// matching, at least once. That's still true regardless of what's on the
+// device today -- it only asserts "this preset CAN be built correctly",
+// shown as a star in the library list.
+function completedKey(id) { return `delugePatchBook:completed:${id}`; }
+function isCompleted(id) {
+  try { return localStorage.getItem(completedKey(id)) === '1'; }
+  catch (e) { return false; }
 }
-function saveChecked(id, checked) {
-  try { localStorage.setItem(progressKey(id), JSON.stringify(checked)); } catch (e) { /* storage unavailable */ }
+function markCompleted(id) {
+  try { localStorage.setItem(completedKey(id), '1'); } catch (e) { /* storage unavailable */ }
 }
-function getProgress(id) {
-  const checked = loadChecked(id);
-  const done = Object.values(checked).filter(Boolean).length;
-  const total = Object.keys(checked).length;
-  return { done, total };
+function clearCompleted(id) {
+  try { localStorage.removeItem(completedKey(id)); } catch (e) { /* storage unavailable */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -4472,8 +4575,7 @@ function isBeginnerMode() { return !document.getElementById('modeToggle').checke
 // "Show manual reference" / "Show tips" toggles: same on/off pattern as other simple
 // UI prefs in this app (see UI_BOOL_KEYS below) -- read straight off the
 // checkbox, persisted to localStorage under their own keys so a reload keeps
-// the setting, same treatment loadChecked()/saveChecked() give per-preset
-// progress. Defaults to on for "Show tips" (a pure teaching aid with no
+// the setting. Defaults to on for "Show tips" (a pure teaching aid with no
 // downside to always seeing) and off for "Show manual reference" (denser citation
 // text some users may not want cluttering every step by default).
 const UI_BOOL_KEYS = {
@@ -4580,31 +4682,12 @@ function wireLibraryFilters() {
 // selected, since it only means anything against the preset it was read for.
 let lastCheckFieldStatus = null;
 
-// Rebuilt by renderGuide() every time it runs: [{ el, body, step, stepId }]
+// Rebuilt by renderGuide() every time it runs: [{ el, body, step }]
 // for exactly the steps it classified as "live" (see isLiveStep()) this
 // time around. Consulted (not renderGuide() itself) whenever a live CC
 // value changes, so a knob turn recolors just these few DOM nodes instead
 // of rebuilding the whole guide -- see refreshLiveSteps() below.
 let renderedLiveSteps = [];
-
-// A live step's checkbox mirrors the device in real time, both ways: ticks
-// itself the moment the live value matches, and UN-ticks itself the moment
-// it no longer does (e.g. the knob gets bumped again) -- unlike a file-based
-// "Check now" step's tick, which is a deliberate one-way milestone (see the
-// comment in the renderGuide() loop below for why that one stays one-way).
-// status === null (no live value received yet for this step) leaves
-// whatever was already checked/unchecked alone, since there's no live truth
-// yet to assert either way -- most relevantly, it doesn't fight a manual
-// tick made before any CC arrived.
-function syncLiveChecked(checked, presetId, stepId, status) {
-  if (status === null) return !!checked[stepId];
-  const shouldBeChecked = status === 'ok';
-  if (checked[stepId] !== shouldBeChecked) {
-    checked[stepId] = shouldBeChecked;
-    saveChecked(presetId, checked);
-  }
-  return shouldBeChecked;
-}
 
 // Colors one ck()-marked fragment from its live status, AND, whenever it's
 // not yet (or no longer) a match, appends a small up/down arrow showing
@@ -4643,19 +4726,11 @@ function applyLiveSpanVisuals(spanEl) {
 // changed: there are only ever a handful of live steps in one guide, so the
 // extra work is negligible, and it avoids needing a per-field -> step index.
 function refreshLiveSteps() {
-  for (const { el, body, step, stepId } of renderedLiveSteps) {
+  for (const { el, body, step } of renderedLiveSteps) {
     const status = liveStepStatus(step);
     el.classList.remove('check-ok', 'check-changed', 'check-unexpected', 'check-untouched');
     el.classList.toggle('step-live-waiting', status === null);
     if (status) el.classList.add(`check-${status}`);
-    if (currentPreset && status !== null) {
-      const checked = loadChecked(currentPreset.id);
-      const isChecked = syncLiveChecked(checked, currentPreset.id, stepId, status);
-      el.classList.toggle('done', isChecked);
-      const cb = el.querySelector('input[type="checkbox"]');
-      if (cb) cb.checked = isChecked;
-      updateProgressText(currentPreset.id);
-    }
     for (const spanEl of body.querySelectorAll('[data-check-path]')) {
       applyLiveSpanVisuals(spanEl);
     }
@@ -4789,6 +4864,8 @@ function conceptForCheckKey(key) {
 const CHECK_FIELD_RESET_HOW = {
   mode: { how: shift('SYNTH MODE'), format: v => v.toUpperCase() },
   polyphonic: { how: shift('POLYPHONY'), format: v => v.toUpperCase() },
+  transpose: { how: `${shift('XPOSE')} (under MASTER)`, format: v => `${v} st` },
+  cents: { how: `${shift('XPOSE')} (under MASTER, fine-tune)`, format: v => `${v} cents` },
   'osc1.type': { how: shift('OSC1 TYPE'), format: v => v.toUpperCase() },
   'osc1.transpose': { how: shift('OSC1 TRANSPOSE'), format: v => `${v} st` },
   'osc1.cents': { how: `${shift('OSC1 TRANSPOSE')} (fine-tune)`, format: v => `${v} cents` },
@@ -4834,7 +4911,10 @@ const CHECK_FIELD_RESET_HOW = {
   'defaultParams.lfo2Rate': { how: shift('LFO2 RATE') },
   'lfo2.syncLevel': { how: shift('LFO2 SYNC'), format: syncLevelName },
   'arpeggiator.mode': { how: `${shift('MODE')} (under VOICE)`, format: v => v.toUpperCase() },
+  'arpeggiator.noteMode': { how: `${shift('MODE')} (under VOICE)`, format: v => v.toUpperCase() },
+  'arpeggiator.octaveMode': { how: `${shift('MODE')} (under VOICE)`, format: v => v.toUpperCase() },
   'arpeggiator.numOctaves': { how: `${shift('NUMBER OF OCTAVES')} (under VOICE)` },
+  'arpeggiator.syncLevel': { how: `${shift('SYNC')} (under VOICE)`, format: v => syncLevelName(packedSyncOption(v, '0')) },
   'defaultParams.arpeggiatorGate': { how: `${shift('GATE')} (under VOICE)` },
   'defaultParams.arpeggiatorRate': { how: `${shift('RATE')} (under VOICE)` },
   modFXType: { how: `${shift('TYPE')} (under MOD-FX)`, format: v => v.toUpperCase() },
@@ -4961,7 +5041,6 @@ function renderGuide(item, sections) {
   document.getElementById('guidePack').textContent = item.pack;
   document.getElementById('guideTitle').textContent = item.name;
 
-  const checked = loadChecked(item.id);
   const container = document.getElementById('guideSections');
   container.innerHTML = '';
   // Repopulated below, one entry per rendered "live" step -- refreshLiveSteps()
@@ -4975,7 +5054,6 @@ function renderGuide(item, sections) {
   // when actually needed without permanently eating space in the guide a
   // returning user already knows how to read.
 
-  let stepIndex = 0;
   sections.forEach((section) => {
     const block = document.createElement('div');
     block.className = 'section-block';
@@ -4984,38 +5062,14 @@ function renderGuide(item, sections) {
     title.textContent = section.title;
     block.appendChild(title);
     for (const step of section.steps) {
-      const stepId = String(stepIndex++);
       // Live steps never consult the file-based check result, and vice
       // versa -- see isLiveStep()'s comment for why a step is never allowed
       // to blend the two.
       const live = deluge.connected && isLiveStep(step);
       const checkStatus = live ? liveStepStatus(step) : stepCheckStatus(step);
-      if (live) {
-        // Live: the tick tracks the device in real time, both ways -- see
-        // syncLiveChecked()'s own comment for why that's different from...
-        syncLiveChecked(checked, item.id, stepId, checkStatus);
-      } else if (checkStatus === 'ok' && !checked[stepId]) {
-        // ...this file-based "Check now" case: a perfect match ticks the
-        // box for real, same as the user checking it off by hand, but only
-        // ever forward -- it persists like any other manual tick even if a
-        // later check finds the same field no longer matching (each click
-        // is a deliberate snapshot/milestone, not a live truth feed).
-        checked[stepId] = true;
-        saveChecked(item.id, checked);
-      }
       const el = document.createElement('div');
-      el.className = 'step' + (checked[stepId] ? ' done' : '') + (checkStatus ? ` check-${checkStatus}` : '') + (step.indent ? ' step-indent' : '');
+      el.className = 'step' + (checkStatus ? ` check-${checkStatus}` : '') + (step.indent ? ' step-indent' : '');
       if (live) el.classList.toggle('step-live-waiting', checkStatus === null);
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.checked = !!checked[stepId];
-      cb.addEventListener('change', () => {
-        checked[stepId] = cb.checked;
-        saveChecked(item.id, checked);
-        el.classList.toggle('done', cb.checked);
-        updateProgressText(item.id);
-        renderLibrary(document.getElementById('searchBox').value);
-      });
       // "live" (device connected, MIDI Follow covers every field of this
       // step) vs. "check pending..." (device connected, but this step needs
       // an explicit Check now -- and none has run yet this preset). Neither
@@ -5037,7 +5091,7 @@ function renderGuide(item, sections) {
         for (const spanEl of body.querySelectorAll('[data-check-path]')) {
           applyLiveSpanVisuals(spanEl);
         }
-        renderedLiveSteps.push({ el, body, step, stepId });
+        renderedLiveSteps.push({ el, body, step });
       } else if (lastCheckFieldStatus) {
         for (const spanEl of body.querySelectorAll('[data-check-path]')) {
           const s = lastCheckFieldStatus.get(spanEl.dataset.checkPath);
@@ -5046,18 +5100,20 @@ function renderGuide(item, sections) {
       }
       const demoBtn = body.querySelector('.demo-open-btn');
       if (demoBtn) demoBtn.addEventListener('click', () => openAudioDemo(demoBtn.dataset.demo));
-      el.appendChild(cb);
       el.appendChild(body);
       block.appendChild(el);
     }
     container.appendChild(block);
   });
-  updateProgressText(item.id);
+  updateCompletedText(item.id);
 }
 
-function updateProgressText(id) {
-  const { done, total } = getProgress(id);
-  document.getElementById('progressText').textContent = `${done} / ${total} steps done`;
+function updateCompletedText(id) {
+  const el = document.getElementById('completedText');
+  const btn = document.getElementById('resetCompletedBtn');
+  const done = isCompleted(id);
+  el.textContent = done ? '★ Built correctly before' : '';
+  btn.hidden = !done;
 }
 
 // ---------------------------------------------------------------------------
@@ -5097,11 +5153,12 @@ document.getElementById('libraryCollapseToggle').addEventListener('click', funct
   const collapsed = document.body.classList.toggle('sidebar-collapsed');
   this.setAttribute('aria-expanded', String(!collapsed));
 });
-document.getElementById('resetProgressBtn').addEventListener('click', () => {
+document.getElementById('resetCompletedBtn').addEventListener('click', () => {
   if (!currentPreset) return;
-  if (!confirm('Reset progress for this preset?')) return;
-  saveChecked(currentPreset.id, {});
-  selectPreset(currentPreset);
+  if (!confirm('Clear the "built correctly before" star for this preset?')) return;
+  clearCompleted(currentPreset.id);
+  updateCompletedText(currentPreset.id);
+  renderLibrary(document.getElementById('searchBox').value);
 });
 document.getElementById('glossaryBtn').addEventListener('click', openGlossary);
 document.getElementById('userGuideBtn').addEventListener('click', openUserGuide);
@@ -5747,8 +5804,13 @@ document.getElementById('checkOnDeviceBtn').addEventListener('click', async () =
     const totalFields = result.steps.reduce((n, s) => n + s.fields.length, 0);
     const okFields = result.steps.reduce((n, s) => n + s.fields.filter(f => f.ok).length, 0);
     statusEl.textContent = `Checked against ${result.path}: ${okFields} / ${totalFields} fields match. See the colored steps below.`;
+    // Every single field matched -- this preset has now been built correctly
+    // at least once, a durable fact worth keeping even after the device
+    // moves on to something else. See completedKey()'s own comment.
+    if (totalFields > 0 && okFields === totalFields) markCompleted(currentPreset.id);
     renderGuide(currentPreset, buildGuide(patch));
     renderUnexpectedChanges(findUnexpectedChanges(result));
+    renderLibrary(document.getElementById('searchBox').value);
   } catch (err) {
     statusEl.textContent = '';
     alert('Check failed: ' + err.message);

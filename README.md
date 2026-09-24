@@ -35,8 +35,9 @@ leave your browser.
    Deluge-hardware instructions (`[SHIFT]+[PAD]` shortcuts, real on-device
    values) and terse synthesis-language descriptions.
 5. Switch between the tabs above the guide:
-   - **Steps** — the build guide itself, tick items off as you go (progress
-     is remembered per preset).
+   - **Steps** — the build guide itself. Steps color themselves from **Check
+     now** / live MIDI-Follow data (see below); the first time every field
+     matches at once, the preset gets a permanent ★ in the library list.
    - **Mod Matrix** — every modulation routing in the preset as a table.
    - **Signal Path** — a diagram of the preset's actual signal flow; hover
      any box for its parameter values, hover a colored source node below the
