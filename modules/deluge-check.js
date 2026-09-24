@@ -183,9 +183,12 @@ function parseDelugeXml(xmlText) {
   // stringToPolyphonyMode()) -- normalize here too so buildCheckSteps()'s
   // "General"/Polyphony field compares the real name on both sides
   // consistently, not a raw digit that would never match a modern file's
-  // own name-based value.
+  // own name-based value. Anything else unrecognized (any other digit, a
+  // typo, ...) falls through to firmware's own final `else` and resolves
+  // to POLY, same as app.js's parser.
   if (obj.polyphonic === '0') obj.polyphonic = 'auto';
   else if (obj.polyphonic === '2') obj.polyphonic = 'choke';
+  else if (obj.polyphonic && !['mono', 'auto', 'legato', 'choke', 'poly'].includes(obj.polyphonic)) obj.polyphonic = 'poly';
   return obj;
 }
 
@@ -203,6 +206,9 @@ const INIT_PATCH_XML = `<?xml version="1.0" encoding="UTF-8"?>
 	polyphonic="poly"
 	voicePriority="1"
 	mode="subtractive"
+	transpose="0"
+	cents="0"
+	clippingAmount="0"
 	modFXType="none"
 	lpfMode="24dB"
 	hpfMode="HPLadder"
@@ -218,6 +224,15 @@ const INIT_PATCH_XML = `<?xml version="1.0" encoding="UTF-8"?>
 		transpose="0"
 		cents="0"
 		retrigPhase="-1" />
+	<modulator1
+		transpose="0"
+		cents="0"
+		retrigPhase="-1" />
+	<modulator2
+		transpose="0"
+		cents="0"
+		retrigPhase="-1"
+		toModulator1="0" />
 	<lfo1 type="triangle" syncLevel="0" syncType="0" />
 	<lfo2 type="triangle" syncLevel="0" syncType="0" />
 	<lfo3 type="triangle" syncLevel="0" syncType="0" />
@@ -644,6 +659,50 @@ function parseNumericValue(raw) {
 const RAW_PARAM_RANGE = 0x7fffffff;
 
 /**
+ * Der Wert, den das Deluge-Display für einen q31-Parameter tatsächlich
+ * zeigt (0-50, dieselbe Formel wie app.js's eigenes dv()/q31Pct()) --
+ * NICHT der Rohwert selbst. Ein fester Prozentsatz des vollen Rohbereichs
+ * kann NIEMALS gleichzeitig garantieren, dass (a) zwei Rohwerte mit
+ * IDENTISCHEM Display-Wert immer als Treffer gelten UND (b) zwei
+ * BENACHBARTE Display-Werte immer als Unterschied gelten -- das
+ * doppelte Runden (Rohwert -> 0-100 -> 0-50) kann bei einem festen 2%-
+ * Toleranzfenster echte, unvermeidbare Lücken von >2% zwischen zwei Werten
+ * lassen, die auf dem Gerät (und im Guide-Text) als exakt dieselbe Zahl
+ * angezeigt werden. Real bestätigt: Factory/148 Warm 5th Pad.XML, LPF-
+ * Resonanz Ziel 0x9C000000 vs. ein Rebuild 0x9EB851E6 -- beide zeigen
+ * "6", liegen aber ~2.12% auseinander (Standardtoleranz: 2%). Direkt
+ * gemeldet als kritisch ("wie soll dies der user merken? wert deuge und
+ * app identisch, feld grün. da ist keine toleranz"). evaluateSteps()
+ * nutzt dies als zusätzliches ODER-Kriterium NUR für ungeranged q31-Felder
+ * (kein eigenes field.rawRange -- Sync-Level/Unison/etc. haben ihre
+ * eigene, bereits korrekt skalierte Toleranz und sind hier nicht
+ * betroffen), NIE als Ersatz für den Prozentsatz-Vergleich.
+ */
+function dvValue(raw) {
+  if (raw === undefined || raw === null) return null;
+  const str = String(raw).trim();
+  if (!/^0x[0-9a-f]{8}$/i.test(str)) return null;
+  let n = parseInt(str, 16);
+  if (n > 0x7fffffff) n -= 0x100000000;
+  const f = n / 2147483648;
+  const pct = Math.round(((f + 1) / 2) * 100);
+  return Math.round(pct / 2);
+}
+
+// Same idea as dvValue(), but for the handful of "half precision" fields
+// (oscillator pulse width -- see app.js's dvHalfPrecision() for the full
+// firmware-source explanation of why these use a different raw<->display
+// formula) that only ever use the positive half of the raw range.
+function dvHalfPrecisionValue(raw) {
+  if (raw === undefined || raw === null) return null;
+  const str = String(raw).trim();
+  if (!/^0x[0-9a-f]{8}$/i.test(str)) return null;
+  let n = parseInt(str, 16);
+  if (n > 0x7fffffff) n -= 0x100000000;
+  return Math.floor((n * 100 + 2147483648) / 4294967296);
+}
+
+/**
  * Vergleicht Ziel- und Ist-Wert. Bei numerischen Werten wird die
  * Toleranz (in Roheinheiten, siehe resolveToleranceAbsolute in
  * deluge-check-settings.js) angewendet. Bei nicht-numerischen Werten
@@ -737,15 +796,30 @@ function fieldStatus(ok, targetIsDefault, actualIsDefault) {
  * @param {object} actualObj  geparste Check-Datei (aktueller Fortschritt)
  * @param {object} settings   siehe deluge-check-settings.js (resolveToleranceAbsolute)
  */
+// Same as valuesMatch(), but for a field with no custom rawRange (i.e. a
+// plain, full-range q31 parameter meant to be read via the Deluge's own
+// 0-50 display, not a small integer like a sync level or unison count
+// that already has its own correctly-scaled range) ALSO accepts a match
+// whenever both values round to the identical dv() display number -- see
+// dvValue()'s own comment for why the percentage tolerance alone can't
+// guarantee that on its own.
+function matchesWithDisplayFallback(a, b, toleranceAbs, field) {
+  if (valuesMatch(a, b, toleranceAbs)) return true;
+  if (field.rawRange) return false; // has its own already-correct scale -- not a dv() field
+  const da = dvValue(a);
+  const db = dvValue(b);
+  return da !== null && db !== null && da === db;
+}
+
 function evaluateSteps(steps, targetObj, actualObj, settings) {
   const initObj = getInitPatchObj();
   return steps.map((step) => {
     const fields = step.fields.map((field) => {
       const { targetValue, actualValue, initValue } = resolveFieldValues(field, targetObj, actualObj, initObj);
       const toleranceAbs = settings.resolveToleranceAbsolute(field.key, field);
-      const ok = valuesMatch(targetValue, actualValue, toleranceAbs);
-      const targetIsDefault = valuesMatch(targetValue, initValue, toleranceAbs);
-      const actualIsDefault = valuesMatch(actualValue, initValue, toleranceAbs);
+      const ok = matchesWithDisplayFallback(targetValue, actualValue, toleranceAbs, field);
+      const targetIsDefault = matchesWithDisplayFallback(targetValue, initValue, toleranceAbs, field);
+      const actualIsDefault = matchesWithDisplayFallback(actualValue, initValue, toleranceAbs, field);
       const status = fieldStatus(ok, targetIsDefault, actualIsDefault);
       // `key` doubles as the lookup app.js's ck()/cf() markers use -- for a
       // normal field it's the same string as `path`, for a cable field
@@ -847,7 +921,7 @@ class DelugeCheck {
   }
 }
 
-return { parseDelugeXml, getValueAtPath, parseNumericValue, RAW_PARAM_RANGE, valuesMatch, evaluateSteps, DelugeCheck };
+return { parseDelugeXml, getValueAtPath, parseNumericValue, RAW_PARAM_RANGE, valuesMatch, dvValue, dvHalfPrecisionValue, evaluateSteps, DelugeCheck };
 })();
 
 // ---------------------------------------------------------------------

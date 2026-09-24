@@ -59,6 +59,12 @@ function repairXmlFragment(fragment) {
     .replace(/="([^"]*)""/g, '="$1"')
     .replace(/="([^"]*)"/g, (m, val) => `="${val.replace(/</g, '&lt;').replace(/>/g, '&gt;')}"`);
 }
+// The only 5 valid modern polyphonic-mode strings (firmware source,
+// util/functions.cpp's polyphonyModeToString()) -- anything else (a stray
+// digit, a typo, ...) firmware's own stringToPolyphonyMode() silently
+// resolves to POLY via its final `else` (aside from "0"/"2", its two
+// documented pre-June-2017 numeric special cases, handled separately).
+const VALID_POLYPHONIC_MODES = new Set(['mono', 'auto', 'legato', 'choke', 'poly']);
 function parseDelugeXml(xmlText) {
   // Older Deluge firmware (<3.0) writes <firmwareVersion> and <sound> as
   // sibling top-level elements, which is not well-formed XML (a document can
@@ -97,8 +103,15 @@ function parseDelugeXml(xmlText) {
   // Factory presets that still carry it (e.g. "080 House.XML"). Left
   // un-normalized, the guide/check would show/compare the literal digit
   // ("Polyphony: 0"), not a name the SELECT knob's menu actually has.
+  // Reported directly ("SHIFT+POLYPHONY, turn SELECT to 1."): firmware's
+  // own stringToPolyphonyMode() only special-cases "0" and "2" -- EVERY
+  // other unrecognized string (any other digit, a typo, ...) falls through
+  // to its final `else` and resolves to POLY, not left as the raw digit.
+  // "1" specifically was never a documented old numeric code for anything;
+  // it just happens to hit that same catch-all default.
   if (sound.polyphonic === '0') sound.polyphonic = 'auto';
   else if (sound.polyphonic === '2') sound.polyphonic = 'choke';
+  else if (sound.polyphonic && !VALID_POLYPHONIC_MODES.has(sound.polyphonic)) sound.polyphonic = 'poly';
   return sound;
 }
 
@@ -271,11 +284,18 @@ const INIT = {
   delayRate: '0x00000000',
   delayFeedback: '0x80000000',
   delaySyncLevel: '7',
+  // Confirmed via a real-corpus scan (~2053 files): 1663 have pingPong="1"
+  // vs only 99 with "0" -- ping-pong ON is the true, overwhelmingly common
+  // firmware default (matches deluge-check.js's own INIT_PATCH_XML
+  // fixture), not "0"/off as the naive on/off flag reading below used to
+  // assume.
+  delayPingPong: '1',
   reverbAmount: '0x80000000',
   arpMode: 'off',
   arpeggiatorRate: '0x00000000',
   arpeggiatorGate: '0x00000000',
   arpSyncLevel: '7',
+  arpNumOctaves: '2',
   modulatorAmount: '0x80000000',
   clippingAmount: '0',
   bitCrush: '0x80000000',
@@ -657,6 +677,33 @@ function cablesOf(patch) {
       ? { ...c, polarity, depthModulators, depthModulator: depthModulators[0], depthModulatedBy: depthModulators[0].source }
       : { ...c, polarity };
   });
+}
+
+// A cable whose (source, destination) matches one of the patch's own
+// <modKnob controlsParam="Y" patchAmountFromSource="X"/> entries is
+// directly controlled by turning a physical gold knob -- confirmed real
+// via the corpus: Init.XML's own default vibrato-depth knob assignment
+// (controlsParam="pitch" patchAmountFromSource="lfo1") exists with NO
+// backing <patchCable> at all (depth 0 = simply no cable yet), so the
+// cable only appears once that knob is actually turned away from center.
+// Its exact resulting depth is whatever the physical knob's position
+// happened to be at that moment -- not something any step ever instructs
+// the user to dial to a precise value the way a normal mod-matrix
+// "Patch: X → Y" SELECT+DEPTH turn does. Reported directly ("when mapping
+// the gold knobs, and they are not perfect on 0, the corresponding patch
+// cables can occur, thats no error then") -- its own DEPTH is therefore
+// never checked (see the two checkFields call sites below), while
+// whether it's connected at all, and its polarity, still are.
+function goldKnobControlledCables(patch) {
+  const knobsRaw = get(patch, 'modKnobs.modKnob', []) || [];
+  const knobs = Array.isArray(knobsRaw) ? knobsRaw : [knobsRaw];
+  const pairs = new Set();
+  for (const k of knobs) {
+    if (k && k.patchAmountFromSource && k.controlsParam) {
+      pairs.add(`${k.patchAmountFromSource}\u0000${k.controlsParam}`);
+    }
+  }
+  return pairs;
 }
 
 // The Deluge has no dedicated per-parameter knobs beyond two contextual gold
@@ -1193,6 +1240,38 @@ function describeRetrigPhase(osc, label, oscNum) {
     { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Oscillator column, Retrigger Phase)', 88), conceptKey: 'osc.retrigPhase' });
 }
 
+// Same real, audible on/off toggle as describeRetrigPhase() above, but for
+// FM's operators -- confirmed via firmware source (gui/menu_item/generate/
+// g_menus.inc: modulator0PhaseMenu/modulator1PhaseMenu are real
+// osc::RetriggerPhase menu items, SHIFT+RETRIG PHASE in the MOD1/MOD2
+// shortcut-pad row) and the real corpus (65 of 133 FM presets have
+// modulator1.retrigPhase set, same -1=off / 0=on-at-start-of-waveform
+// convention osc1/osc2 already use) -- previously not covered anywhere in
+// this app at all for either modulator. Reported directly ("retriger ohe
+// ... have shortcuts as well").
+function describeModulatorRetrigPhase(mod, label, modNum) {
+  if (!mod || mod.retrigPhase === undefined) return null;
+  const path = `modulator${modNum}.retrigPhase`;
+  if (mod.retrigPhase === '-1') return null; // off/free-running default
+  const col = `MOD${modNum}`;
+  return makeStep(`${label}: retrigger phase`,
+    `${ck(path, `${shift(`${col} RETRIG PHASE`)} on, at raw value ${val(mod.retrigPhase)} (0 = the very start of the waveform) instead of left off/free-running`)}.`,
+    `${ck(path, `Retrigger phase: on (raw ${val(mod.retrigPhase)})`)}.`,
+    [cf(path, 'Retrig phase')],
+    { manualRef: manualRef('§4.1 "Synthesizer Concepts" (FM Synthesis)', 81), conceptKey: 'fm' });
+}
+
+// Mod FX (chorus/flanger/phaser/...) params aren't uniformly available
+// across every type -- confirmed via firmware source (gui/menu_item/mod_fx/
+// {depth_patched,depth_unpatched,offset,feedback}.h's own isRelevant()):
+// e.g. FLANGER has no Depth or Offset control at all, only Rate and
+// Feedback. Reported directly ("flanger has no depth and offset. only rate
+// and feedback"). Rate is relevant for every type except NONE (mod FX off
+// entirely), so it's never gated here.
+const MODFX_DEPTH_TYPES = new Set(['chorus', 'StereoChorus', 'grainFX', 'phaser', 'TapeWarble', 'dimension']);
+const MODFX_OFFSET_TYPES = new Set(['chorus', 'StereoChorus', 'grainFX', 'TapeWarble', 'dimension']);
+const MODFX_FEEDBACK_TYPES = new Set(['flanger', 'phaser', 'grainFX', 'TapeWarble']);
+
 function buildGuide(patch) {
   const sections = [];
   const dp = patch.defaultParams || {};
@@ -1231,11 +1310,17 @@ function buildGuide(patch) {
     // Reported directly against real hardware: SHIFT+XPOSE, in the MASTER
     // section -- corrects an earlier, wrong assumption (drawn from the
     // shortcut-pad grid in firmware source alone) that there was no
-    // dedicated pad for this.
-    (patch.transpose && patch.transpose !== '0')
+    // dedicated pad for this. Gate also fires on cents alone (fine-tune
+    // can differ even while whole-semitone transpose stays 0) -- found via
+    // a systematic audit of every buildCheckSteps() field ("its own field
+    // has no visible step" class of bug, same as several others this
+    // session): 'cents' was always an unconditional check field, but this
+    // whole step -- the only place it's ever mentioned -- used to gate on
+    // transpose alone.
+    (patch.transpose && patch.transpose !== '0') || (patch.cents && patch.cents !== '0')
       ? makeStep('Master transpose',
-          `${ck('transpose', `${shift('XPOSE')} (under MASTER) to ${val(patch.transpose)} semitones${patch.cents && patch.cents !== '0' ? ` (${val(patch.cents)} cents fine-tune)` : ''}`)}.`,
-          `Master transpose: ${ck('transpose', val(patch.transpose + ' st'))}${patch.cents && patch.cents !== '0' ? `, ${ck('cents', val(patch.cents + ' cents'))} fine-tune` : ''}.`,
+          `${ck('transpose', `${shift('XPOSE')} (under MASTER) to ${val(patch.transpose || 0)} semitones${patch.cents && patch.cents !== '0' ? ` (${val(patch.cents)} cents fine-tune)` : ''}`)}.`,
+          `Master transpose: ${ck('transpose', val((patch.transpose || 0) + ' st'))}${patch.cents && patch.cents !== '0' ? `, ${ck('cents', val(patch.cents + ' cents'))} fine-tune` : ''}.`,
           [cf('transpose', 'Transpose'), cf('cents', 'Cents')])
       : null,
   ]);
@@ -1247,28 +1332,45 @@ function buildGuide(patch) {
   const oscSteps = [];
   if (patch.mode === 'fm') {
     const fmRef = { manualRef: manualRef('§4.1 "Synthesizer Concepts" (FM Synthesis)', 81), conceptKey: 'fm' };
+    // Carriers can self-feedback too, just like the modulators -- confirmed
+    // via firmware source (gui/ui/menus.cpp's shortcut grid: source0/
+    // source1FeedbackMenu sit in the SAME row as Volume/Transpose/Type,
+    // SHIFT+FEEDBACK) and the real corpus (many FM presets have a
+    // genuinely non-default carrier1Feedback/carrier2Feedback, e.g.
+    // Fmhh.XML/Fmsn.XML at the max 0x7FFFFFFF) -- previously not covered
+    // anywhere in this app at all. Reported directly: a real preset's
+    // status line read fewer matches than every visible (green) step
+    // could account for -- a gold knob reassigned straight to
+    // carrier1Feedback (no matching guide step or check field at all) was
+    // one of the two invisible gaps.
+    const carrier1Fb = (dp.carrier1Feedback && q31Differs(dp.carrier1Feedback, INIT.modulatorAmount)) ? dp.carrier1Feedback : null;
+    const carrier2Fb = (dp.carrier2Feedback && q31Differs(dp.carrier2Feedback, INIT.modulatorAmount)) ? dp.carrier2Feedback : null;
     if (patch.osc1) oscSteps.push(makeStep('FM Carrier 1',
-      `${ck('osc1.transpose', `${shift('OSC1 TRANSPOSE')} ${val((patch.osc1.transpose || 0) + ' st')}${patch.osc1.cents && patch.osc1.cents !== '0' ? ` (fine-tune ${val(patch.osc1.cents + ' cents')})` : ''}`)}.`,
-      `${ck('osc1.transpose', `Carrier 1 transpose ${val(patch.osc1.transpose || 0)} st`)}.`,
-      [cf('osc1.transpose', 'Transpose')], fmRef));
+      `${ck('osc1.transpose', `${shift('OSC1 TRANSPOSE')} ${val((patch.osc1.transpose || 0) + ' st')}${patch.osc1.cents && patch.osc1.cents !== '0' ? ` (fine-tune ${val(patch.osc1.cents + ' cents')})` : ''}`)}${carrier1Fb ? `. ${ck('defaultParams.carrier1Feedback', `${shift('OSC1 FEEDBACK')} ${val(dv(carrier1Fb))}`)}` : ''}.`,
+      `${ck('osc1.transpose', `Carrier 1 transpose ${val(patch.osc1.transpose || 0)} st`)}${carrier1Fb ? `, ${ck('defaultParams.carrier1Feedback', `feedback ${val(rawPct(carrier1Fb) + '%')}`)}` : ''}.`,
+      [cf('osc1.transpose', 'Transpose'), carrier1Fb && cf('defaultParams.carrier1Feedback', 'Feedback')].filter(Boolean), fmRef));
     if (patch.osc2) oscSteps.push(makeStep('FM Carrier 2',
-      `${ck('osc2.transpose', `${shift('OSC2 TRANSPOSE')} ${val((patch.osc2.transpose || 0) + ' st')}${patch.osc2.cents && patch.osc2.cents !== '0' ? ` (fine-tune ${val(patch.osc2.cents + ' cents')})` : ''}`)}.`,
-      `${ck('osc2.transpose', `Carrier 2 transpose ${val(patch.osc2.transpose || 0)} st`)}.`,
-      [cf('osc2.transpose', 'Transpose')], fmRef));
+      `${ck('osc2.transpose', `${shift('OSC2 TRANSPOSE')} ${val((patch.osc2.transpose || 0) + ' st')}${patch.osc2.cents && patch.osc2.cents !== '0' ? ` (fine-tune ${val(patch.osc2.cents + ' cents')})` : ''}`)}${carrier2Fb ? `. ${ck('defaultParams.carrier2Feedback', `${shift('OSC2 FEEDBACK')} ${val(dv(carrier2Fb))}`)}` : ''}.`,
+      `${ck('osc2.transpose', `Carrier 2 transpose ${val(patch.osc2.transpose || 0)} st`)}${carrier2Fb ? `, ${ck('defaultParams.carrier2Feedback', `feedback ${val(rawPct(carrier2Fb) + '%')}`)}` : ''}.`,
+      [cf('osc2.transpose', 'Transpose'), carrier2Fb && cf('defaultParams.carrier2Feedback', 'Feedback')].filter(Boolean), fmRef));
     if (patch.modulator1) {
       const amt = (dp.modulator1Amount && q31Differs(dp.modulator1Amount, INIT.modulatorAmount)) ? dp.modulator1Amount : null;
+      const fb = (dp.modulator1Feedback && q31Differs(dp.modulator1Feedback, INIT.modulatorAmount)) ? dp.modulator1Feedback : null;
       oscSteps.push(makeStep('FM Modulator 1 (shapes Carrier 1 & 2)',
-        `${ck('modulator1.transpose', `${shift('MOD1 TRANSPOSE')} ${val((patch.modulator1.transpose || 0) + ' st')}`)}${amt ? `. ${ck('defaultParams.modulator1Amount', `${shift('MOD1 LEVEL')} ${val(dv(amt))}`)}` : ''}.`,
-        `${ck('modulator1.transpose', `Modulator 1: transpose ${val(patch.modulator1.transpose || 0)} st`)}${amt ? `, ${ck('defaultParams.modulator1Amount', `amount ${val(rawPct(amt) + '%')}`)}` : ''}.`,
-        [cf('modulator1.transpose', 'Transpose'), cf('defaultParams.modulator1Amount', 'Amount')], fmRef));
+        `${ck('modulator1.transpose', `${shift('MOD1 TRANSPOSE')} ${val((patch.modulator1.transpose || 0) + ' st')}`)}${amt ? `. ${ck('defaultParams.modulator1Amount', `${shift('MOD1 LEVEL')} ${val(dv(amt))}`)}` : ''}${fb ? `. ${ck('defaultParams.modulator1Feedback', `${shift('MOD1 FEEDBACK')} ${val(dv(fb))}`)}` : ''}.`,
+        `${ck('modulator1.transpose', `Modulator 1: transpose ${val(patch.modulator1.transpose || 0)} st`)}${amt ? `, ${ck('defaultParams.modulator1Amount', `amount ${val(rawPct(amt) + '%')}`)}` : ''}${fb ? `, ${ck('defaultParams.modulator1Feedback', `feedback ${val(rawPct(fb) + '%')}`)}` : ''}.`,
+        [cf('modulator1.transpose', 'Transpose'), cf('defaultParams.modulator1Amount', 'Amount'), cf('defaultParams.modulator1Feedback', 'Feedback')], fmRef));
+      oscSteps.push(describeModulatorRetrigPhase(patch.modulator1, 'FM Modulator 1', 1));
     }
     if (patch.modulator2) {
       const amt = (dp.modulator2Amount && q31Differs(dp.modulator2Amount, INIT.modulatorAmount)) ? dp.modulator2Amount : null;
+      const fb = (dp.modulator2Feedback && q31Differs(dp.modulator2Feedback, INIT.modulatorAmount)) ? dp.modulator2Feedback : null;
       const feedsMod1 = patch.modulator2.toModulator1 && patch.modulator2.toModulator1 !== '0';
       oscSteps.push(makeStep('FM Modulator 2 (shapes Carrier 2)',
-        `${ck('modulator2.transpose', `${shift('MOD2 TRANSPOSE')} ${val((patch.modulator2.transpose || 0) + ' st')}`)}${amt ? `. ${ck('defaultParams.modulator2Amount', `${shift('MOD2 LEVEL')} ${val(dv(amt))}`)}` : ''}${feedsMod1 ? `. ${shift('MOD2 DESTINATION')} set to ${val('MOD1')} so it also feeds Modulator 1` : ''}.`,
-        `${ck('modulator2.transpose', `Modulator 2: transpose ${val(patch.modulator2.transpose || 0)} st`)}${amt ? `, ${ck('defaultParams.modulator2Amount', `amount ${val(rawPct(amt) + '%')}`)}` : ''}${feedsMod1 ? ', feeding into modulator 1' : ''}.`,
-        [cf('modulator2.transpose', 'Transpose'), cf('defaultParams.modulator2Amount', 'Amount')], fmRef));
+        `${ck('modulator2.transpose', `${shift('MOD2 TRANSPOSE')} ${val((patch.modulator2.transpose || 0) + ' st')}`)}${amt ? `. ${ck('defaultParams.modulator2Amount', `${shift('MOD2 LEVEL')} ${val(dv(amt))}`)}` : ''}${fb ? `. ${ck('defaultParams.modulator2Feedback', `${shift('MOD2 FEEDBACK')} ${val(dv(fb))}`)}` : ''}${feedsMod1 ? `. ${ck('modulator2.toModulator1', `${shift('MOD2 DESTINATION')} set to ${val('MOD1')} so it also feeds Modulator 1`)}` : ''}.`,
+        `${ck('modulator2.transpose', `Modulator 2: transpose ${val(patch.modulator2.transpose || 0)} st`)}${amt ? `, ${ck('defaultParams.modulator2Amount', `amount ${val(rawPct(amt) + '%')}`)}` : ''}${fb ? `, ${ck('defaultParams.modulator2Feedback', `feedback ${val(rawPct(fb) + '%')}`)}` : ''}${feedsMod1 ? `, ${ck('modulator2.toModulator1', 'feeding into modulator 1')}` : ''}.`,
+        [cf('modulator2.transpose', 'Transpose'), cf('defaultParams.modulator2Amount', 'Amount'), cf('defaultParams.modulator2Feedback', 'Feedback'), feedsMod1 && cf('modulator2.toModulator1', 'Destination')].filter(Boolean), fmRef));
+      oscSteps.push(describeModulatorRetrigPhase(patch.modulator2, 'FM Modulator 2', 2));
     }
   } else {
     oscSteps.push(describeOsc(patch.osc1, 'Oscillator 1', 1));
@@ -1402,7 +1504,13 @@ function buildGuide(patch) {
         [cf('lpfMode', 'Mode')],
         { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (LPF)', 89), conceptKey: 'filter.lpf' }));
     }
-    if (dp.hpfFrequency && q31Differs(dp.hpfFrequency, INIT.hpfFrequency)) {
+    // Same OR-gate as LPF above (resonance alone, frequency still at
+    // default, must still show the step) -- found via a systematic audit
+    // of every buildCheckSteps() field: 'defaultParams.hpfResonance' was
+    // always unconditionally checked, but this HPF gate, unlike the LPF
+    // one right above it, never considered resonance on its own a reason
+    // to show the step at all.
+    if (dp.hpfFrequency && (q31Differs(dp.hpfFrequency, INIT.hpfFrequency) || (dp.hpfResonance && q31Differs(dp.hpfResonance, INIT.hpfResonance)))) {
       const hpfMode = patch.hpfMode || INIT.hpfMode;
       filterSteps.push(makeStep('High-pass filter',
         `${ck('defaultParams.hpfFrequency', `${shift('FREQUENCY')} (under HPF) to ${val(dv(dp.hpfFrequency))}`)}${dp.hpfResonance ? `. ${ck('defaultParams.hpfResonance', `${shift('RESONANCE')} to ${val(dv(dp.hpfResonance))}`)}` : ''}.`,
@@ -1454,6 +1562,7 @@ function buildGuide(patch) {
 
   // --- LFOs & modulation matrix --------------------------------------
   const cables = cablesOf(patch);
+  const goldKnobCables = goldKnobControlledCables(patch);
   const lfoSteps = [];
   ['lfo1', 'lfo2'].forEach((key, i) => {
     const n = i + 1;
@@ -1469,7 +1578,18 @@ function buildGuide(patch) {
     // Reported directly against real hardware ("lfo sync steps missing")
     // using a test patch built exactly that way.
     const syncChanged = lfo && lfo.syncLevel && lfo.syncLevel !== '0';
-    if (!lfo || (!routed && !rateChanged && !syncChanged)) return;
+    // Shape is its own reason to show this LFO's step too, same as being
+    // routed/rate-changed/synced -- "triangle" is the real firmware
+    // default (confirmed: deluge-check.js's own INIT_PATCH_XML fixture),
+    // matching the display fallback `lfo.type || 'triangle'` just below.
+    // Previously missing from this gate entirely, so a preset with ONLY
+    // its shape changed (still unrouted, rate/sync both at default) showed
+    // no LFO step at all, yet buildCheckSteps() still checked shape
+    // unconditionally -- an invisible mismatch with no step to explain
+    // it. Reported directly via the "Still to check" popup itself
+    // ("still to check lfo shape, but no lfo steps visible").
+    const shapeChanged = lfo && lfo.type && lfo.type !== 'triangle';
+    if (!lfo || (!routed && !rateChanged && !syncChanged && !shapeChanged)) return;
     // Rate gets its own step, split off from Shape/Sync: Rate is a real
     // MIDI-Follow-mappable param, but Shape (an enum) and Sync (a list, see
     // syncLevelName()'s own comment) are neither -- bundling all three into
@@ -1602,9 +1722,12 @@ function buildGuide(patch) {
       const polarityNote = polarityEligible
         ? ` While still in that depth menu: press ${kbd(polarityButton)} to set its polarity to ${ck(polarityKey, val(c.polarity.toUpperCase()))}.`
         : '';
-      const checkFields = polarityEligible
-        ? [cf(connectKey, 'Connect'), cf(amountKey, 'Depth'), cf(polarityKey, 'Polarity')]
-        : [cf(connectKey, 'Connect'), cf(amountKey, 'Depth')];
+      const goldKnobControlled = goldKnobCables.has(`${c.source}\u0000${c.destination}`);
+      const checkFields = [
+        cf(connectKey, 'Connect'),
+        !goldKnobControlled && cf(amountKey, 'Depth'),
+        polarityEligible && cf(polarityKey, 'Polarity'),
+      ].filter(Boolean);
       // LFO1 -> pitch has its own dedicated single-pad shortcut (VIBRATO,
       // manual §4.8: "Depth of modulation between LFO1 and pitch") for the
       // plain single-source case. Real-hardware testing confirmed that
@@ -1663,9 +1786,9 @@ function buildGuide(patch) {
       ? [cf('arpeggiator.mode', 'Mode'), cf('arpeggiator.noteMode', 'Note mode'), cf('arpeggiator.octaveMode', 'Octave mode')]
       : [cf('arpeggiator.mode', 'Mode')];
     arpSteps.push(makeStep('Enable arpeggiator',
-      `${ck('arpeggiator.mode', `${shift('MODE')} (under VOICE) to ${val(presetName)}`)}${arp.numOctaves ? `. ${ck('arpeggiator.numOctaves', `${shift('NUMBER OF OCTAVES')} to ${val(arp.numOctaves)}`)}` : ''}.`,
-      `${ck('arpeggiator.mode', `Arpeggiator: ${val(presetName)} mode`)}${arp.numOctaves ? `, ${ck('arpeggiator.numOctaves', `${arp.numOctaves} octave(s)`)}` : ''}.`,
-      [...modeCheckFields, cf('arpeggiator.numOctaves', 'Octaves')],
+      `${ck('arpeggiator.mode', `${shift('MODE')} (under VOICE) to ${val(presetName)}`)}.`,
+      `${ck('arpeggiator.mode', `Arpeggiator: ${val(presetName)} mode`)}.`,
+      modeCheckFields,
       { manualRef: manualRef('§4.12 "Arpeggiator"', 108), conceptKey: 'arpeggiator' }));
   }
   // Sync gets its own step, same reasoning as LFO/Delay/Sidechain sync
@@ -1710,7 +1833,24 @@ function buildGuide(patch) {
     arpSteps.push(makeStep('Arpeggiator rate/gate',
       `${beginnerParts.join('. ')}.`,
       `Arpeggiator ${expertParts.join(', ')}.`,
-      [cf('defaultParams.arpeggiatorGate', 'Gate'), cf('defaultParams.arpeggiatorRate', 'Rate')],
+      [arpGateChanged && cf('defaultParams.arpeggiatorGate', 'Gate'), arpRateChanged && cf('defaultParams.arpeggiatorRate', 'Rate')].filter(Boolean),
+      { manualRef: manualRef('§4.12 "Arpeggiator"', 108), conceptKey: 'arpeggiator' }));
+  }
+  // Octaves gets its OWN step, same "matters regardless of Mode" reasoning
+  // as Rate/Gate above, but deliberately NOT merged into that same step:
+  // Rate/Gate are real MIDI-Follow-mappable params, but Octaves (a small
+  // integer count) isn't, and isLiveStep()'s "one uncovered field
+  // disqualifies the whole step" rule means bundling it in would silently
+  // stop Rate/Gate from ever going live too. Previously only mentioned
+  // inside "Enable arpeggiator" (gated on Mode being on), so a preset with
+  // Octaves changed but Mode still "off" showed nothing for it at all --
+  // found via a systematic audit of every buildCheckSteps() field.
+  const arpOctavesChanged = arp && arp.numOctaves && arp.numOctaves !== INIT.arpNumOctaves;
+  if (arpOctavesChanged) {
+    arpSteps.push(makeStep('Arpeggiator octaves',
+      `${ck('arpeggiator.numOctaves', `${shift('NUMBER OF OCTAVES')} (under VOICE) to ${val(arp.numOctaves)}`)}.`,
+      `Arpeggiator ${ck('arpeggiator.numOctaves', `${val(arp.numOctaves)} octave(s)`)}.`,
+      [cf('arpeggiator.numOctaves', 'Octaves')],
       { manualRef: manualRef('§4.12 "Arpeggiator"', 108), conceptKey: 'arpeggiator' }));
   }
   if (arpSteps.length) push('Arpeggiator', arpSteps);
@@ -1724,12 +1864,19 @@ function buildGuide(patch) {
     // found via a real target/actual diff where the target's own
     // modFXOffset was a real, substantial non-default value the rebuild
     // had no way to even know needed setting.
-    const offsetChanged = dp.modFXOffset && q31Differs(dp.modFXOffset, INIT.modFXOffset);
-    const feedbackChanged = dp.modFXFeedback && q31Differs(dp.modFXFeedback, INIT.modFXFeedback);
+    // Depth/Offset/Feedback aren't all relevant to every Mod FX type --
+    // see MODFX_DEPTH_TYPES/MODFX_OFFSET_TYPES/MODFX_FEEDBACK_TYPES above.
+    const depthShown = dp.modFXDepth && MODFX_DEPTH_TYPES.has(patch.modFXType);
+    const offsetChanged = dp.modFXOffset && MODFX_OFFSET_TYPES.has(patch.modFXType) && q31Differs(dp.modFXOffset, INIT.modFXOffset);
+    const feedbackChanged = dp.modFXFeedback && MODFX_FEEDBACK_TYPES.has(patch.modFXType) && q31Differs(dp.modFXFeedback, INIT.modFXFeedback);
+    const modFxCheckFields = [cf('modFXType', 'Type'), cf('defaultParams.modFXRate', 'Rate')];
+    if (depthShown) modFxCheckFields.push(cf('defaultParams.modFXDepth', 'Depth'));
+    if (MODFX_OFFSET_TYPES.has(patch.modFXType)) modFxCheckFields.push(cf('defaultParams.modFXOffset', 'Offset'));
+    if (MODFX_FEEDBACK_TYPES.has(patch.modFXType)) modFxCheckFields.push(cf('defaultParams.modFXFeedback', 'Feedback'));
     fxSteps.push(makeStep('Mod FX',
-      `${ck('modFXType', `${shift('TYPE')} (under MOD-FX) to ${val(patch.modFXType)}`)}${dp.modFXRate ? `. ${ck('defaultParams.modFXRate', `${shift('RATE')} to ${val(dv(dp.modFXRate))}`)}` : ''}${dp.modFXDepth ? `. ${ck('defaultParams.modFXDepth', `${shift('DEPTH')} to ${val(dv(dp.modFXDepth))}`)}` : ''}${offsetChanged ? `. ${ck('defaultParams.modFXOffset', `${shift('OFFSET')} to ${val(dv(dp.modFXOffset))}`)}` : ''}${feedbackChanged ? `. ${ck('defaultParams.modFXFeedback', `${shift('FEEDBACK')} to ${val(dv(dp.modFXFeedback))}`)}` : ''}.`,
-      `${ck('modFXType', val(patch.modFXType))}${dp.modFXRate ? ` ${ck('defaultParams.modFXRate', `rate ${rawPct(dp.modFXRate)}%`)}` : ''}${dp.modFXDepth ? `, ${ck('defaultParams.modFXDepth', `depth ${rawPct(dp.modFXDepth)}%`)}` : ''}${offsetChanged ? `, ${ck('defaultParams.modFXOffset', `offset ${rawPct(dp.modFXOffset)}%`)}` : ''}${feedbackChanged ? `, ${ck('defaultParams.modFXFeedback', `feedback ${rawPct(dp.modFXFeedback)}%`)}` : ''}.`,
-      [cf('modFXType', 'Type'), cf('defaultParams.modFXRate', 'Rate'), cf('defaultParams.modFXDepth', 'Depth'), cf('defaultParams.modFXOffset', 'Offset'), cf('defaultParams.modFXFeedback', 'Feedback')],
+      `${ck('modFXType', `${shift('TYPE')} (under MOD-FX) to ${val(patch.modFXType)}`)}${dp.modFXRate ? `. ${ck('defaultParams.modFXRate', `${shift('RATE')} to ${val(dv(dp.modFXRate))}`)}` : ''}${depthShown ? `. ${ck('defaultParams.modFXDepth', `${shift('DEPTH')} to ${val(dv(dp.modFXDepth))}`)}` : ''}${offsetChanged ? `. ${ck('defaultParams.modFXOffset', `${shift('OFFSET')} to ${val(dv(dp.modFXOffset))}`)}` : ''}${feedbackChanged ? `. ${ck('defaultParams.modFXFeedback', `${shift('FEEDBACK')} to ${val(dv(dp.modFXFeedback))}`)}` : ''}.`,
+      `${ck('modFXType', val(patch.modFXType))}${dp.modFXRate ? ` ${ck('defaultParams.modFXRate', `rate ${rawPct(dp.modFXRate)}%`)}` : ''}${depthShown ? `, ${ck('defaultParams.modFXDepth', `depth ${rawPct(dp.modFXDepth)}%`)}` : ''}${offsetChanged ? `, ${ck('defaultParams.modFXOffset', `offset ${rawPct(dp.modFXOffset)}%`)}` : ''}${feedbackChanged ? `, ${ck('defaultParams.modFXFeedback', `feedback ${rawPct(dp.modFXFeedback)}%`)}` : ''}.`,
+      modFxCheckFields,
       { manualRef: manualRef('§11.7 "Modulation Effects"', 235), conceptKey: 'modfx' }));
   }
   const delay = patch.delay;
@@ -1741,11 +1888,17 @@ function buildGuide(patch) {
   // uncovered field disqualifies the whole step" rule), same class of bug
   // as the earlier LPF/HPF Mode split. Reported directly against real
   // hardware: "Delay amount and rate are live values".
-  if (dp.delayFeedback && q31Differs(dp.delayFeedback, INIT.delayFeedback)) {
+  // Gate also fires on Rate alone (Feedback still at default) -- found via
+  // a systematic audit of every buildCheckSteps() field: 'defaultParams.
+  // delayRate' was always unconditionally checked, but this was the only
+  // place it's ever mentioned, and it only used to gate on Feedback.
+  const delayFeedbackChanged = dp.delayFeedback && q31Differs(dp.delayFeedback, INIT.delayFeedback);
+  const delayRateChanged = dp.delayRate && q31Differs(dp.delayRate, INIT.delayRate);
+  if (delayFeedbackChanged || delayRateChanged) {
     fxSteps.push(makeStep('Delay',
-      `${ck('defaultParams.delayFeedback', `${shift('AMOUNT')} (under FX/DELAY) to ${val(dv(dp.delayFeedback))}`)}${dp.delayRate ? `. ${ck('defaultParams.delayRate', `${shift('RATE')} to ${val(dv(dp.delayRate))}`)}` : ''}.`,
-      `${ck('defaultParams.delayFeedback', `Delay feedback ${val(rawPct(dp.delayFeedback) + '%')}`)}${dp.delayRate ? `, ${ck('defaultParams.delayRate', `rate ${val(rawPct(dp.delayRate) + '%')}`)}` : ''}.`,
-      [cf('defaultParams.delayFeedback', 'Amount'), cf('defaultParams.delayRate', 'Rate')],
+      `${delayFeedbackChanged ? ck('defaultParams.delayFeedback', `${shift('AMOUNT')} (under FX/DELAY) to ${val(dv(dp.delayFeedback))}`) : ''}${delayFeedbackChanged && delayRateChanged ? '. ' : ''}${delayRateChanged ? ck('defaultParams.delayRate', `${shift('RATE')} (under FX/DELAY) to ${val(dv(dp.delayRate))}`) : ''}.`,
+      `${delayFeedbackChanged ? ck('defaultParams.delayFeedback', `Delay feedback ${val(rawPct(dp.delayFeedback) + '%')}`) : ''}${delayFeedbackChanged && delayRateChanged ? ', ' : ''}${delayRateChanged ? ck('defaultParams.delayRate', `rate ${val(rawPct(dp.delayRate) + '%')}`) : ''}.`,
+      [delayFeedbackChanged && cf('defaultParams.delayFeedback', 'Amount'), delayRateChanged && cf('defaultParams.delayRate', 'Rate')].filter(Boolean),
       { manualRef: manualRef('§11.5 "Delay"', 228), conceptKey: 'delay' }));
   }
   // Delay's own tempo-sync (manual §11.5/grid shortcuts: "SYNC -- Time
@@ -1756,22 +1909,48 @@ function buildGuide(patch) {
   // sitting at the init default 7) -- a real, audible difference in delay
   // repeat timing, not just cosmetic.
   const delaySyncChanged = delay && plainDiffers(delay.syncLevel, INIT.delaySyncLevel);
-  const delayPingPongOn = delay && delay.pingPong === '1';
+  // Found via the systematic "check all parameters" audit, using real-corpus
+  // data: this used to gate on `pingPong === '1'` (treating "on" as the
+  // one describable/checkable state), but a corpus scan of ~2053 real files
+  // shows pingPong="1" in 1663 of them vs only 99 with "0" -- ping-pong ON
+  // IS the near-universal true default. So the old gate fired for almost
+  // every ordinary preset (unhelpfully restating the default) while never
+  // surfacing the rarer, more meaningful case: a preset that deliberately
+  // turns ping-pong OFF. Fixed to gate (and describe) on whether it DIFFERS
+  // from its own default, same as every other field in this file.
+  const delayPingPongChanged = delay && delay.pingPong !== undefined && delay.pingPong !== INIT.delayPingPong;
   const delayAnalogOn = delay && delay.analog === '1';
-  if (delayPingPongOn || delayAnalogOn || delaySyncChanged) {
+  if (delayPingPongChanged || delayAnalogOn || delaySyncChanged) {
+    const pingPongOn = delay.pingPong === '1';
     const beginnerParts = [
-      delayPingPongOn && ck('delay.pingPong', `${shift('PINGPONG')} on`),
+      // Gesture confirmed directly against real hardware: SHIFT+STEREO,
+      // not SHIFT+PINGPONG -- the physical pad under DELAY is silkscreened
+      // "STEREO" even though the internal parameter/menu name is PingPong.
+      delayPingPongChanged && ck('delay.pingPong', `${shift('STEREO')} ${pingPongOn ? 'on' : 'off'}`),
       delayAnalogOn && ck('delay.analog', `${shift('TYPE')} to ${val('ANALOG')}`),
       delaySyncChanged && ck('delay.syncLevel', `${shift('SYNC')} to ${val(syncLevelName(packedSyncOption(delay.syncLevel, delay.syncType)))}`),
     ].filter(Boolean);
     const expertParts = [
-      delayPingPongOn && ck('delay.pingPong', 'ping-pong'),
+      delayPingPongChanged && ck('delay.pingPong', `ping-pong ${pingPongOn ? 'on' : 'off'}`),
+      delayAnalogOn && ck('delay.analog', 'analog'),
       delaySyncChanged && ck('delay.syncLevel', `synced to ${val(syncLevelName(packedSyncOption(delay.syncLevel, delay.syncType)))}`),
+    ].filter(Boolean);
+    // checkFields mirrors exactly what's shown above -- a field whose own
+    // condition is false here (e.g. pingPong unchanged, only Analog/Sync
+    // mentioned) previously stayed in this list unconditionally, so an
+    // "unexpected" pingPong mismatch could still turn the WHOLE step red
+    // even though nothing about ping-pong ever appeared in its text.
+    // Reported directly ("delay ping pong ... is checked, but not shown in
+    // the step").
+    const checkFields = [
+      delayPingPongChanged && cf('delay.pingPong', 'PingPong'),
+      delayAnalogOn && cf('delay.analog', 'Analog'),
+      delaySyncChanged && cf('delay.syncLevel', 'Sync'),
     ].filter(Boolean);
     fxSteps.push(makeStep('Delay settings',
       `${beginnerParts.join('. ')}.`,
       `${expertParts.join(', ')}.`,
-      [cf('delay.pingPong', 'PingPong'), cf('delay.analog', 'Analog'), cf('delay.syncLevel', 'Sync')],
+      checkFields,
       { manualRef: manualRef('§11.5 "Delay"', 228), conceptKey: 'delay' }));
   }
   if (dp.reverbAmount && q31Differs(dp.reverbAmount, INIT.reverbAmount)) {
@@ -1838,13 +2017,15 @@ function buildGuide(patch) {
   }
   // Separate from the bass/treble boost knobs above: which frequency each
   // shelf actually pivots at. Previously not covered anywhere at all (found
-  // via real-hardware testing against a preset that moves both) -- no
-  // confirmed dedicated grid-shortcut pad name for these two specifically,
-  // so routed through the nested menu rather than guessing one (same
-  // "don't guess a shortcut" fallback cable steps already use).
+  // via real-hardware testing against a preset that moves both). Gesture
+  // confirmed directly against real hardware: SHIFT+BASS / SHIFT+TREBLE --
+  // the same pads as the plain gain step above, held with SHIFT (matches
+  // firmware's own shortcut-pad grid: bassFreqMenu/trebleFreqMenu sit
+  // directly below bassMenu/trebleMenu in the same column) -- corrects an
+  // earlier, wrong assumption that there was no dedicated pad for these.
   if (eq && (q31Differs(eq.bassFrequency || '0x00000000', '0x00000000') || q31Differs(eq.trebleFrequency || '0x00000000', '0x00000000'))) {
     charSteps.push(makeStep('EQ frequency',
-      `${ck('defaultParams.equalizer.bassFrequency', `${selectMenu('SOUND → EQ → BASS FREQUENCY')} to ${val(dv(eq.bassFrequency || '0x00000000'))}`)}. ${ck('defaultParams.equalizer.trebleFrequency', `${selectMenu('SOUND → EQ → TREBLE FREQUENCY')} to ${val(dv(eq.trebleFrequency || '0x00000000'))}`)}.`,
+      `${ck('defaultParams.equalizer.bassFrequency', `${shift('BASS')} to ${val(dv(eq.bassFrequency || '0x00000000'))}`)}. ${ck('defaultParams.equalizer.trebleFrequency', `${shift('TREBLE')} to ${val(dv(eq.trebleFrequency || '0x00000000'))}`)}.`,
       `${ck('defaultParams.equalizer.bassFrequency', `EQ bass shelf frequency ${val(rawPct(eq.bassFrequency || '0x00000000') + '%')}`)}, ${ck('defaultParams.equalizer.trebleFrequency', `treble shelf frequency ${val(rawPct(eq.trebleFrequency || '0x00000000') + '%')}`)}.`,
       [cf('defaultParams.equalizer.bassFrequency', 'Bass freq'), cf('defaultParams.equalizer.trebleFrequency', 'Treble freq')],
       { manualRef: manualRef('§11.4 "EQ - Equalisation"', 225), conceptKey: 'eq' }));
@@ -1998,10 +2179,17 @@ function buildCheckSteps(patch) {
     { id: 'osc', label: 'Oscillators', fields: isFm ? [
         field('Carrier 1 transpose', 'osc1.transpose'),
         field('Carrier 2 transpose', 'osc2.transpose'),
+        field('Carrier 1 feedback', 'defaultParams.carrier1Feedback'),
+        field('Carrier 2 feedback', 'defaultParams.carrier2Feedback'),
         intField('Modulator 1 transpose', 'modulator1.transpose'),
         intField('Modulator 2 transpose', 'modulator2.transpose'),
+        intField('Modulator 1 retrig phase', 'modulator1.retrigPhase'),
+        intField('Modulator 2 retrig phase', 'modulator2.retrigPhase'),
         field('Modulator 1 amount', 'defaultParams.modulator1Amount'),
         field('Modulator 2 amount', 'defaultParams.modulator2Amount'),
+        field('Modulator 1 feedback', 'defaultParams.modulator1Feedback'),
+        field('Modulator 2 feedback', 'defaultParams.modulator2Feedback'),
+        intField('Modulator 2 destination', 'modulator2.toModulator1', CHECK_BINARY_RANGE),
       ] : [
         field('OSC1 type', 'osc1.type'),
         intField('OSC1 transpose', 'osc1.transpose'),
@@ -2025,10 +2213,20 @@ function buildCheckSteps(patch) {
       ] },
     { id: 'unison', label: 'Unison', fields: [
         intField('Voice count', 'unison.num'),
-        intField('Detune', 'unison.detune', CHECK_UNISON_RANGE),
-        intField('Spread', 'unison.spread', CHECK_UNISON_RANGE),
+        // Detune/Spread only matter with 2+ voices actually stacked -- with
+        // a single voice there's nothing to detune/spread AGAINST, so
+        // firmware lets these sit at whatever leftover value regardless
+        // (same "irrelevant, unrendered" class as FM's stale lpfMode or a
+        // non-flanger Mod FX's stale feedback). Confirmed real: real
+        // Factory/148 Warm 5th Pad.XML has num=1 with detune=4 -- a
+        // meaningless value buildGuide()'s own "Stack voices" step already
+        // never shows a step for (gated the same way, `num > 1`), so
+        // checking it unconditionally here blocked a perfect match on a
+        // field with no visible step at all to explain it.
+        (patch.unison && parseInt(patch.unison.num, 10) > 1) ? intField('Detune', 'unison.detune', CHECK_UNISON_RANGE) : null,
+        (patch.unison && parseInt(patch.unison.num, 10) > 1) ? intField('Spread', 'unison.spread', CHECK_UNISON_RANGE) : null,
         field('Portamento', 'defaultParams.portamento'),
-      ] },
+      ].filter(Boolean) },
     // FM mode has no filter at all -- see buildGuide()'s own comment (real
     // preset "Fmbd.XML": lpfMode="flanger", a stale, never-rendered value
     // that would otherwise show as a bogus "changed" filter mismatch here).
@@ -2064,17 +2262,25 @@ function buildCheckSteps(patch) {
       ] },
     { id: 'fx', label: 'Effects', fields: [
         field('Mod FX type', 'modFXType'),
-        field('Mod FX rate', 'defaultParams.modFXRate'),
-        field('Mod FX depth', 'defaultParams.modFXDepth'),
-        field('Mod FX offset', 'defaultParams.modFXOffset'),
-        field('Mod FX feedback', 'defaultParams.modFXFeedback'),
+        // Rate (like Depth/Offset/Feedback below) is irrelevant when Mod FX
+        // is off entirely (firmware source: gui/menu_item/mod_fx/rate.h's
+        // own isRelevant(), "type != NONE") -- found via a systematic audit
+        // of every buildCheckSteps() field: with type="none" there's no
+        // Mod FX step at all (nothing to show a rate for), yet this was
+        // still checked unconditionally.
+        patch.modFXType !== INIT.modFXType ? field('Mod FX rate', 'defaultParams.modFXRate') : null,
+        // Depth/Offset/Feedback aren't all relevant to every Mod FX type --
+        // see MODFX_DEPTH_TYPES/MODFX_OFFSET_TYPES/MODFX_FEEDBACK_TYPES.
+        MODFX_DEPTH_TYPES.has(patch.modFXType) ? field('Mod FX depth', 'defaultParams.modFXDepth') : null,
+        MODFX_OFFSET_TYPES.has(patch.modFXType) ? field('Mod FX offset', 'defaultParams.modFXOffset') : null,
+        MODFX_FEEDBACK_TYPES.has(patch.modFXType) ? field('Mod FX feedback', 'defaultParams.modFXFeedback') : null,
         intField('Delay ping-pong', 'delay.pingPong', CHECK_BINARY_RANGE),
         intField('Delay analog', 'delay.analog', CHECK_BINARY_RANGE),
         intField('Delay sync level', 'delay.syncLevel', CHECK_SYNC_LEVEL_RANGE),
         field('Delay rate', 'defaultParams.delayRate'),
         field('Delay feedback', 'defaultParams.delayFeedback'),
         field('Reverb send', 'defaultParams.reverbAmount'),
-      ] },
+      ].filter(Boolean) },
     { id: 'sidechain', label: 'Sidechain compressor', fields: [
         field('Sidechain attack', 'sidechain.attack'),
         field('Sidechain release', 'sidechain.release'),
@@ -2094,10 +2300,13 @@ function buildCheckSteps(patch) {
         .filter(c => c.source && c.destination && !cableIsDefault(c))
         .flatMap(c => {
           const label = `${humanize(c.source)} → ${destDisplayName(c.destination)}`;
+          // A gold-knob-controlled cable's own depth is never checked --
+          // see goldKnobControlledCables()'s own comment.
+          const goldKnobControlled = goldKnobControlledCables(patch).has(`${c.source}\u0000${c.destination}`);
           const fields = [
             cableField(`${label} (connected)`, c.source, c.destination, 'connect'),
-            cableField(`${label} (depth)`, c.source, c.destination, 'amount'),
           ];
+          if (!goldKnobControlled) fields.push(cableField(`${label} (depth)`, c.source, c.destination, 'amount'));
           // X/Y (MPE expression) can't have their polarity changed at all
           // (see cableHasPolarity()'s own comment) -- no field for those.
           if (cableHasPolarity(c.source)) {
@@ -4403,6 +4612,16 @@ function printCheatSheet() {
 // Library loading
 // ---------------------------------------------------------------------------
 var library = []; // { id, name, pack, file }
+// Kept sorted (pack, then name, both alphabetical) at every point something
+// gets added to it -- ingestFiles() already sorted its own batch, but the
+// two "load from connected Deluge" paths below (a single preset, or a
+// whole device folder) each just push()ed onto whatever was already there,
+// so a preset picked from the device could land at the end of the list in
+// SD-card/SysEx directory order instead of alphabetically. Reported
+// directly ("presets sollen jeweils sortiert werden sobald geladen").
+function sortLibrary() {
+  library.sort((a, b) => a.pack.localeCompare(b.pack) || a.name.localeCompare(b.name));
+}
 var currentPreset = null;
 // The parsed object for currentPreset -- kept alongside it (rather than
 // threading it through every call site that needs it) so the Compare tab,
@@ -4449,8 +4668,8 @@ async function ingestFiles(fileList, { autoSelectSingle = false } = {}) {
       categories: sniffCategories(rawText),
     });
   }
-  items.sort((a, b) => a.pack.localeCompare(b.pack) || a.name.localeCompare(b.name));
   library = items;
+  sortLibrary();
   statusEl.textContent = `Loaded ${items.length} presets.`;
   renderLibrary(document.getElementById('searchBox').value);
   document.getElementById('libraryBody').hidden = false;
@@ -4530,6 +4749,7 @@ async function selectPreset(item) {
   lastCheckFieldStatus = null;
   const statusEl = document.getElementById('deviceCheckStatus');
   if (statusEl) statusEl.textContent = '';
+  updateCheckStatusClickability();
   renderUnexpectedChanges([]);
   const sections = buildGuide(patch);
   renderGuide(item, sections);
@@ -4876,8 +5096,15 @@ const CHECK_FIELD_RESET_HOW = {
   'osc2.retrigPhase': { how: shift('OSC2 RETRIG PHASE'), format: v => v === '-1' ? 'off' : v },
   'modulator1.transpose': { how: shift('MOD1 TRANSPOSE'), format: v => `${v} st` },
   'modulator2.transpose': { how: shift('MOD2 TRANSPOSE'), format: v => `${v} st` },
+  'modulator1.retrigPhase': { how: shift('MOD1 RETRIG PHASE'), format: v => v === '-1' ? 'off' : v },
+  'modulator2.retrigPhase': { how: shift('MOD2 RETRIG PHASE'), format: v => v === '-1' ? 'off' : v },
   'defaultParams.modulator1Amount': { how: shift('MOD1 LEVEL') },
   'defaultParams.modulator2Amount': { how: shift('MOD2 LEVEL') },
+  'defaultParams.carrier1Feedback': { how: shift('OSC1 FEEDBACK') },
+  'defaultParams.carrier2Feedback': { how: shift('OSC2 FEEDBACK') },
+  'defaultParams.modulator1Feedback': { how: shift('MOD1 FEEDBACK') },
+  'defaultParams.modulator2Feedback': { how: shift('MOD2 FEEDBACK') },
+  'modulator2.toModulator1': { how: shift('MOD2 DESTINATION'), format: v => v && v !== '0' ? 'MOD1' : 'CARRIER 2' },
   'defaultParams.oscAPulseWidth': { how: shift(DEST_SHORTCUT.oscAPhaseWidth), format: dvHalfPrecision },
   'defaultParams.oscBPulseWidth': { how: shift(DEST_SHORTCUT.oscBPhaseWidth), format: dvHalfPrecision },
   'defaultParams.volume': { how: shift(DEST_SHORTCUT.volume) },
@@ -4922,7 +5149,7 @@ const CHECK_FIELD_RESET_HOW = {
   'defaultParams.modFXDepth': { how: `${shift('DEPTH')} (under MOD-FX)` },
   'defaultParams.modFXOffset': { how: `${shift('OFFSET')} (under MOD-FX)` },
   'defaultParams.modFXFeedback': { how: `${shift('FEEDBACK')} (under MOD-FX)` },
-  'delay.pingPong': { how: `${shift('PINGPONG')} (under FX/DELAY)`, format: v => v === '1' ? 'on' : 'off' },
+  'delay.pingPong': { how: `${shift('STEREO')} (under FX/DELAY)`, format: v => v === '1' ? 'on' : 'off' },
   'delay.analog': { how: `${shift('TYPE')} (under FX/DELAY)`, format: v => v === '1' ? 'ANALOG' : 'DIGITAL' },
   'delay.syncLevel': { how: `${shift('SYNC')} (under FX/DELAY)`, format: syncLevelName },
   'defaultParams.delayRate': { how: `${shift('RATE')} (under FX/DELAY)` },
@@ -4937,8 +5164,8 @@ const CHECK_FIELD_RESET_HOW = {
   'defaultParams.waveFold': { how: `via the SOUND menu (${selectMenu('SOUND &gt; WAVEFOLD')})` },
   'defaultParams.equalizer.bass': { how: shift('ADJUST (BASS)') },
   'defaultParams.equalizer.treble': { how: shift('ADJUST (TREBLE)') },
-  'defaultParams.equalizer.bassFrequency': { how: selectMenu('SOUND → EQ → BASS FREQUENCY') },
-  'defaultParams.equalizer.trebleFrequency': { how: selectMenu('SOUND → EQ → TREBLE FREQUENCY') },
+  'defaultParams.equalizer.bassFrequency': { how: shift('BASS') },
+  'defaultParams.equalizer.trebleFrequency': { how: shift('TREBLE') },
 };
 // Generic fallback: a raw q31 hex value formats the same way every other
 // step's value does (0-50 scale via dv()); anything else (enum/plain int)
@@ -5126,6 +5353,7 @@ document.getElementById('searchBox').addEventListener('input', e => renderLibrar
 wireLibraryFilters();
 document.getElementById('modeToggle').addEventListener('change', () => {
   if (currentPreset) selectPreset(currentPreset);
+  updateCheckStatusClickability();
 });
 // "Show manual reference" / "Show tips": restore persisted state on load,
 // then re-render the current guide (if any) whenever one is flipped --
@@ -5526,6 +5754,7 @@ function showFilePickerModal(files, { deviceForCategorize } = {}) {
             loadFolderStatus.textContent = `Loaded ${done} / ${candidates.length}…`;
           }
           document.getElementById('libraryBody').hidden = false;
+          sortLibrary();
           renderLibrary(document.getElementById('searchBox').value);
           loadFolderStatus.textContent = `Loaded ${candidates.length - failed}${filtered ? ' filtered' : ''} preset${candidates.length - failed === 1 ? '' : 's'}. `
             + (failed > 0 ? `${failed} failed to read.` : '');
@@ -5717,6 +5946,7 @@ document.getElementById('loadFromDelugeBtn').addEventListener('click', async () 
       file: { text: async () => text }, rawText: text, categories: sniffCategories(text),
     };
     if (!library.some(l => l.id === item.id)) library.push(item);
+    sortLibrary();
     document.getElementById('libraryBody').hidden = false;
     statusEl.textContent = `Loaded "${name}" from Deluge.`;
     await selectPreset(item);
@@ -5776,6 +6006,95 @@ function confirmSavedToSdCard() {
   });
 }
 
+// One-off celebration the moment a preset FIRST reaches a perfect,
+// every-field match -- reported directly ("popup a little congratulation
+// popup on perfect match"). Purely a nicety; closing it (any way) does
+// nothing else -- the star itself was already saved by markCompleted()
+// before this is even shown.
+function showCompletionCelebration() {
+  openModal(box => {
+    box.classList.add('modal-celebrate');
+    const h = document.createElement('h3');
+    h.textContent = '★ Perfect match!';
+    box.appendChild(h);
+    const p = document.createElement('p');
+    p.textContent = `Every field on "${currentPreset.name}" now matches the target patch. It keeps its star in the library from here on, even after the device moves on to something else.`;
+    box.appendChild(p);
+    const actions = document.createElement('div');
+    actions.className = 'modal-actions';
+    const okBtn = document.createElement('button');
+    okBtn.className = 'btn-primary';
+    okBtn.textContent = 'Nice!';
+    okBtn.addEventListener('click', closeModal);
+    actions.appendChild(okBtn);
+    box.appendChild(actions);
+  });
+}
+
+// Click-to-expand troubleshooting list for the "X / Y fields match" status
+// line -- reported directly ("macht es sinn beim click auf 77/79 ein
+// popup anzuzeigen, was noch fehlt?"): a preset can have every VISIBLE
+// step read green while a couple of check fields still don't match (no
+// step ever shows those specific fields as part of its own text -- see
+// e.g. the carrier1Feedback/toModulator1/retrigPhase gaps found this same
+// session), so the raw "X / Y" count alone gives no way to find out WHICH
+// two without hunting through every step by eye. Deliberately Beginner-
+// mode only (per the same report: "nur im Beginnermode, nicht im
+// Expert") -- Expert mode's whole premise is reading the terser,
+// denser step text directly rather than leaning on an extra summary.
+function showMissingFieldsModal(result) {
+  const missingByStep = result.steps
+    .map(s => ({ label: s.label, fields: s.fields.filter(f => !f.ok) }))
+    .filter(s => s.fields.length);
+  openModal(box => {
+    const h = document.createElement('h3');
+    h.textContent = 'Still to check';
+    box.appendChild(h);
+    if (!missingByStep.length) {
+      const p = document.createElement('p');
+      p.textContent = 'Every field matches.';
+      box.appendChild(p);
+    } else {
+      for (const group of missingByStep) {
+        const title = document.createElement('div');
+        title.className = 'missing-fields-group-title';
+        title.textContent = group.label;
+        box.appendChild(title);
+        for (const f of group.fields) {
+          const howEntry = CHECK_FIELD_RESET_HOW[f.key];
+          const row = document.createElement('div');
+          row.className = 'missing-fields-row';
+          row.innerHTML = `<span class="missing-field-label">${escapeHtml(f.label)}</span>` +
+            `<span class="missing-field-status check-${f.status}">${f.status}</span>` +
+            (howEntry ? `<span class="missing-field-how">${howEntry.how}</span>` : '');
+          box.appendChild(row);
+        }
+      }
+    }
+    const actions = document.createElement('div');
+    actions.className = 'modal-actions';
+    const close = document.createElement('button');
+    close.className = 'btn-secondary';
+    close.textContent = 'Close';
+    close.addEventListener('click', closeModal);
+    actions.appendChild(close);
+    box.appendChild(actions);
+  });
+}
+
+// Toggles the click affordance on #deviceCheckStatus -- only clickable
+// when there's an actual check result with something left unmatched, and
+// only in Beginner mode (see showMissingFieldsModal()'s own comment).
+function updateCheckStatusClickability() {
+  const statusEl = document.getElementById('deviceCheckStatus');
+  const hasGaps = !!(lastCheckResult && lastCheckResult.steps.some(s => s.fields.some(f => !f.ok)));
+  statusEl.classList.toggle('clickable-status', isBeginnerMode() && hasGaps);
+}
+document.getElementById('deviceCheckStatus').addEventListener('click', () => {
+  if (!document.getElementById('deviceCheckStatus').classList.contains('clickable-status')) return;
+  showMissingFieldsModal(lastCheckResult);
+});
+
 document.getElementById('checkOnDeviceBtn').addEventListener('click', async () => {
   if (!currentPreset) { alert('Pick a preset first.'); return; }
   if (!(await confirmSavedToSdCard())) return;
@@ -5804,13 +6123,19 @@ document.getElementById('checkOnDeviceBtn').addEventListener('click', async () =
     const totalFields = result.steps.reduce((n, s) => n + s.fields.length, 0);
     const okFields = result.steps.reduce((n, s) => n + s.fields.filter(f => f.ok).length, 0);
     statusEl.textContent = `Checked against ${result.path}: ${okFields} / ${totalFields} fields match. See the colored steps below.`;
+    updateCheckStatusClickability();
     // Every single field matched -- this preset has now been built correctly
     // at least once, a durable fact worth keeping even after the device
-    // moves on to something else. See completedKey()'s own comment.
-    if (totalFields > 0 && okFields === totalFields) markCompleted(currentPreset.id);
+    // moves on to something else. See completedKey()'s own comment. Only
+    // celebrates the FIRST time this preset reaches it, not every re-check
+    // of an already-starred preset.
+    const perfectMatch = totalFields > 0 && okFields === totalFields;
+    const justCompleted = perfectMatch && !isCompleted(currentPreset.id);
+    if (perfectMatch) markCompleted(currentPreset.id);
     renderGuide(currentPreset, buildGuide(patch));
     renderUnexpectedChanges(findUnexpectedChanges(result));
     renderLibrary(document.getElementById('searchBox').value);
+    if (justCompleted) showCompletionCelebration();
   } catch (err) {
     statusEl.textContent = '';
     alert('Check failed: ' + err.message);

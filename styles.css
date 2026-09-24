@@ -699,6 +699,9 @@ html, body {
 .modal-box p { margin: 0 0 14px; font-size: 13px; color: var(--text-dim); line-height: 1.5; }
 .modal-checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 16px; cursor: pointer; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
+.modal-celebrate h3 { color: var(--accent); text-align: center; font-size: 18px; }
+.modal-celebrate p { text-align: center; }
+.modal-celebrate .modal-actions { justify-content: center; }
 
 .midi-monitor-box { width: min(640px, 92vw); }
 .midi-monitor-box p { margin: 0 0 4px; }
@@ -878,6 +881,22 @@ html, body {
 .btn-check { width: auto; padding: 10px 18px; white-space: nowrap; }
 
 .device-check-status { font-size: 11.5px; color: var(--text-dim); text-align: right; max-width: 220px; }
+/* Beginner-mode-only affordance: click the "X / Y fields match" status
+   line to see exactly which fields still don't match -- see
+   showMissingFieldsModal()'s own comment for why this is gated to
+   Beginner mode. */
+.device-check-status.clickable-status { cursor: pointer; text-decoration: underline dotted; }
+.device-check-status.clickable-status:hover { color: var(--text); }
+.missing-fields-group-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); margin: 14px 0 4px; }
+.missing-fields-group-title:first-child { margin-top: 0; }
+.missing-fields-row { display: flex; align-items: baseline; gap: 8px; padding: 4px 0; font-size: 13px; border-bottom: 1px solid var(--border); }
+.missing-fields-row:last-child { border-bottom: none; }
+.missing-field-label { flex: 1; }
+.missing-field-status { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; padding: 1px 6px; border-radius: 8px; border: 1px solid currentColor; }
+.missing-field-status.check-changed { color: var(--changed); }
+.missing-field-status.check-unexpected { color: var(--danger); }
+.missing-field-status.check-untouched { color: var(--text-dim); }
+.missing-field-how { font-size: 11.5px; color: var(--text-dim); flex-basis: 100%; }
 
 /* Live-device check status, applied directly to a step in the checklist
    below (see stepCheckStatus() in app.js) -- no separate results list. */

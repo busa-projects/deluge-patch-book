@@ -447,16 +447,31 @@ function resolveTargetRaw(path, targetObj) {
  * @param {object} settings   deluge-check-settings.js settings instance
  */
 
+// Same "does the DISPLAYED number agree, even if the raw percentage-window
+// tolerance alone wouldn't call it a match" reasoning as evaluateSteps()'s
+// matchesWithDisplayFallback() in deluge-check.js (see dvValue()'s own
+// comment there for the full explanation and the real-hardware proof) --
+// every live-mappable field is a plain q31 dial with no custom rawRange
+// EXCEPT pulse width, which needs dvHalfPrecisionValue() instead of the
+// standard dvValue().
+function liveMatches(a, b, toleranceAbs, path) {
+  const DC = window.DelugeCheckModule;
+  if (DC.valuesMatch(a, b, toleranceAbs)) return true;
+  const displayFn = HALF_PRECISION_FIELD_PATHS.has(path) ? DC.dvHalfPrecisionValue : DC.dvValue;
+  const da = displayFn(a);
+  const db = displayFn(b);
+  return da !== null && db !== null && da === db;
+}
+
 function liveFieldStatus(tracker, path, targetObj, settings) {
   const liveRaw = tracker.getLiveValue(path);
   if (liveRaw === undefined) return null;
-  const DC = window.DelugeCheckModule;
   const initRaw = LIVE_FIELD_INIT[path];
   const targetRaw = resolveTargetRaw(path, targetObj);
   const toleranceAbs = settings.resolveToleranceAbsolute(path, {});
-  const ok = DC.valuesMatch(targetRaw, liveRaw, toleranceAbs);
-  const targetIsDefault = DC.valuesMatch(targetRaw, initRaw, toleranceAbs);
-  const actualIsDefault = DC.valuesMatch(liveRaw, initRaw, toleranceAbs);
+  const ok = liveMatches(targetRaw, liveRaw, toleranceAbs, path);
+  const targetIsDefault = liveMatches(targetRaw, initRaw, toleranceAbs, path);
+  const actualIsDefault = liveMatches(liveRaw, initRaw, toleranceAbs, path);
   if (targetIsDefault && !actualIsDefault) return 'unexpected';
   if (ok) return 'ok';
   if (!actualIsDefault) return 'changed';
