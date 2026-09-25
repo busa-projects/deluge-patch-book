@@ -590,9 +590,37 @@ function cableHasPolarity(source) { return !POLARITY_FIXED_SOURCES.has(source); 
 // (confirmed real: BOD01_06-Roygbass.XML, an older-format preset, omits
 // <polarity> on every one of its cables).
 function cableDefaultPolarity(source) { return source === 'aftertouch' ? 'unipolar' : 'bipolar'; }
+// Confirmed via firmware source (model/voice/voice.cpp's per-unison render
+// loop): SUBTRACTIVE renders through renderBasicSource() and RINGMOD has
+// its own dedicated branch (`if (synthMode == SynthMode::RINGMOD) { ... }`,
+// straight dsp::Oscillator::renderOsc(), no feedback parameter passed at
+// all) -- the carrier/modulator feedback rendering code (renderSineWave
+// WithFeedback()/renderFMWithFeedbackAdd(), reading LOCAL_CARRIER_n_
+// FEEDBACK/LOCAL_MODULATOR_n_FEEDBACK) only runs in the sibling "else (FM)"
+// branch. So these destinations aren't just menu-hidden outside FM mode
+// (like OSC1/OSC2 LEVEL in Ring Mod, see isRingmod's own comment) -- they
+// are a complete DSP no-op there, never read at all. Confirmed present as
+// real, non-default, functionless leftover data in shipped factory presets
+// too (e.g. Factory/125 Evolving Pad.XML, mode="ringmod": two genuine
+// patch cables into carrier1Feedback, plus non-default base values for
+// both carriers -- all inert). Reported directly: "factory/125 (ringmod)
+// demands carrier feedback, but ringmod does not support that. even on
+// the device, i see the cables, but cant change them" -- matches
+// firmware's osc/source/feedback.h isRelevant(): `sound->getSynthMode()
+// == SynthMode::FM` gates the ENTIRE menu route to this destination, so a
+// cable already routed there can be seen in a cable-list overview but
+// never opened/edited on a non-FM patch.
+const FM_ONLY_CABLE_DESTINATIONS = new Set([
+  'carrier1Feedback', 'carrier2Feedback',
+  'modulator1Volume', 'modulator2Volume',
+  'modulator1Feedback', 'modulator2Feedback',
+  'modulator1Pitch', 'modulator2Pitch',
+]);
 function cablesOf(patch) {
   const cablesRaw = get(patch.defaultParams || {}, 'patchCables.patchCable', []) || [];
-  const cablesList = Array.isArray(cablesRaw) ? cablesRaw : [cablesRaw];
+  const isFmPatch = patch.mode === 'fm';
+  const cablesList = (Array.isArray(cablesRaw) ? cablesRaw : [cablesRaw])
+    .filter(c => isFmPatch || !FM_ONLY_CABLE_DESTINATIONS.has(c.destination));
   // A cable's own depth can itself be modulated by a second source (real,
   // documented Deluge feature -- e.g. LFO1 -> pitch, whose *depth* is in
   // turn modulated by LFO1 again, a "double mod"). Two different XML
@@ -1223,19 +1251,34 @@ function describeOsc(osc, label, oscNum) {
 // value is a real, audible difference (fixed phase alignment on every
 // note vs. free-running) this guide never mentioned at all. Kept as its
 // own step (same reasoning as pulse width: an independent on/off setting,
-// not tied to waveform/transpose). The exact raw-value-to-degrees mapping
-// for a non-"-1" value isn't confirmed (the manual gives the concept, not
-// the encoding), so the instructional text only commits to "on vs off" and
-// shows the raw stored number, rather than inventing a specific ° figure.
+// not tied to waveform/transpose).
+//
+// Confirmed via firmware source (gui/menu_item/osc/retrigger_phase.h's own
+// readCurrentValue(): `this->setValue(value / 11930464)`, with the menu's
+// own getMinValue()/getMaxValue() of -1/360) and verified against the real
+// corpus (every one of 28 distinct real raw values divides out to an exact
+// multiple of 10 degrees, e.g. raw="238609280" -> 20 deg, one exception at
+// 115 deg from manual fine-editing) -- the raw stored number is a signed
+// reinterpretation of the same uint32 the menu divides by 11930464 to get
+// whole degrees (0-360). Reported directly: "phase in the osc should be
+// off, 0, 10, 20, 30, ..., 360. now some big integer values are shown".
+function retrigPhaseDegrees(raw) {
+  if (raw === undefined || raw === null) return null;
+  const n = parseInt(raw, 10);
+  if (Number.isNaN(n) || n === -1) return null;
+  const u = n < 0 ? n + 0x100000000 : n;
+  return Math.floor(u / 11930464);
+}
 function describeRetrigPhase(osc, label, oscNum) {
   if (!osc || osc.retrigPhase === undefined) return null;
   const path = `osc${oscNum}.retrigPhase`;
   const off = osc.retrigPhase === '-1';
   if (off) return null; // "-1" is the off/free-running default -- nothing to build
   const col = `OSC${oscNum}`;
+  const deg = retrigPhaseDegrees(osc.retrigPhase);
   return makeStep(`${label}: retrigger phase`,
-    `${ck(path, `${shift(`${col} RETRIG PHASE`)} on, at raw value ${val(osc.retrigPhase)} (0 = the very start of the waveform) instead of left off/free-running`)}.`,
-    `${ck(path, `Retrigger phase: on (raw ${val(osc.retrigPhase)})`)}.`,
+    `${ck(path, `${shift(`${col} RETRIG PHASE`)} on, at ${val(deg + '°')} (0° = the very start of the waveform) instead of left off/free-running`)}.`,
+    `${ck(path, `Retrigger phase: on (${val(deg + '°')})`)}.`,
     [cf(path, 'Retrig phase')],
     { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Oscillator column, Retrigger Phase)', 88), conceptKey: 'osc.retrigPhase' });
 }
@@ -1254,9 +1297,10 @@ function describeModulatorRetrigPhase(mod, label, modNum) {
   const path = `modulator${modNum}.retrigPhase`;
   if (mod.retrigPhase === '-1') return null; // off/free-running default
   const col = `MOD${modNum}`;
+  const deg = retrigPhaseDegrees(mod.retrigPhase);
   return makeStep(`${label}: retrigger phase`,
-    `${ck(path, `${shift(`${col} RETRIG PHASE`)} on, at raw value ${val(mod.retrigPhase)} (0 = the very start of the waveform) instead of left off/free-running`)}.`,
-    `${ck(path, `Retrigger phase: on (raw ${val(mod.retrigPhase)})`)}.`,
+    `${ck(path, `${shift(`${col} RETRIG PHASE`)} on, at ${val(deg + '°')} (0° = the very start of the waveform) instead of left off/free-running`)}.`,
+    `${ck(path, `Retrigger phase: on (${val(deg + '°')})`)}.`,
     [cf(path, 'Retrig phase')],
     { manualRef: manualRef('§4.1 "Synthesizer Concepts" (FM Synthesis)', 81), conceptKey: 'fm' });
 }
@@ -1276,6 +1320,14 @@ function buildGuide(patch) {
   const sections = [];
   const dp = patch.defaultParams || {};
   const isFm = patch.mode === 'fm';
+  // Confirmed directly against firmware source (gui/menu_item/osc/source/
+  // volume.h's own isRelevant(): `return sound->getSynthMode() !=
+  // SynthMode::RINGMOD;`) -- the OSC1/OSC2 LEVEL menu item is not just
+  // unused but literally hidden/inaccessible on real hardware in Ring Mod
+  // mode, since the two oscillators are multiplied rather than mixed at
+  // independent levels. Reported directly: "ringmod does not support osc
+  // level, but step is shown".
+  const isRingmod = patch.mode === 'ringmod';
   const push = (title, steps) => {
     const s = steps.filter(Boolean);
     if (s.length) sections.push({ title, steps: s });
@@ -1295,12 +1347,30 @@ function buildGuide(patch) {
           [cf('mode', 'Mode')],
           { manualRef: manualRef('"Selecting FM, Ring Mod or Subtractive Synthesizer"', 94), conceptKey: patch.mode === 'fm' ? 'fm' : undefined })
       : null,
-    (patch.polyphonic && patch.polyphonic !== INIT.polyphonic)
-      ? makeStep('Polyphony',
-          `${shift('POLYPHONY')}, turn SELECT to ${ck('polyphonic', val(patch.polyphonic.toUpperCase()))}.`,
-          `Polyphony: ${ck('polyphonic', val(patch.polyphonic))}.`,
-          [cf('polyphonic', 'Polyphony')],
-          { manualRef: manualRef('§4.11 "Deluge Voices" (Setting the Synth Polyphony)', 105) })
+    // Level/Pan/Master transpose grouped here (rather than Level/Pan
+    // staying back in the Mixer section) because they're physically
+    // adjacent on real hardware -- confirmed against firmware source
+    // (gui/ui/menus.cpp's paramShortcutsForSounds grid: &volumeMenu,
+    // &masterTransposeMenu, &vibratoMenu, &panMenu and &synthModeMenu all
+    // sit in the same shortcut-grid column). Reported directly: "would be
+    // nice if after synth mode, master level, then pan and then master
+    // transpose would follow, as they are shown in the same [grid
+    // column]". Vibrato is deliberately left out of this reordering --
+    // it's really "LFO1 routed to pitch" and belongs with the rest of the
+    // modulation-routing steps, not as a standalone defaultParams field.
+    (dp.volume && q31Differs(dp.volume, INIT.volume))
+      ? makeStep('Level',
+          `${ck('defaultParams.volume', `${shift('LEVEL')} set to ${val(dv(dp.volume))}`)}.`,
+          `${ck('defaultParams.volume', `Overall level: ${val(rawPct(dp.volume) + '%')}`)}.`,
+          [cf('defaultParams.volume', 'Level')],
+          { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Level)', 88), conceptKey: 'mixer.level' })
+      : null,
+    (dp.pan && q31Differs(dp.pan, INIT.pan))
+      ? makeStep('Pan',
+          `${ck('defaultParams.pan', `${shift('PAN')} set to ${val(dvPan(dp.pan))} (range -25 left to +25 right)`)}.`,
+          `${ck('defaultParams.pan', `Pan: ${val(pctOfPan(dp.pan) + '%')}`)} (negative = left).`,
+          [cf('defaultParams.pan', 'Pan')],
+          { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Pan)', 92), conceptKey: 'mixer.pan' })
       : null,
     // Confirmed real via firmware source (gui/menu_item/master_transpose.h)
     // and the real preset corpus (58 files with a genuine non-zero value,
@@ -1322,6 +1392,13 @@ function buildGuide(patch) {
           `${ck('transpose', `${shift('XPOSE')} (under MASTER) to ${val(patch.transpose || 0)} semitones${patch.cents && patch.cents !== '0' ? ` (${val(patch.cents)} cents fine-tune)` : ''}`)}.`,
           `Master transpose: ${ck('transpose', val((patch.transpose || 0) + ' st'))}${patch.cents && patch.cents !== '0' ? `, ${ck('cents', val(patch.cents + ' cents'))} fine-tune` : ''}.`,
           [cf('transpose', 'Transpose'), cf('cents', 'Cents')])
+      : null,
+    (patch.polyphonic && patch.polyphonic !== INIT.polyphonic)
+      ? makeStep('Polyphony',
+          `${shift('POLYPHONY')}, turn SELECT to ${ck('polyphonic', val(patch.polyphonic.toUpperCase()))}.`,
+          `Polyphony: ${ck('polyphonic', val(patch.polyphonic))}.`,
+          [cf('polyphonic', 'Polyphony')],
+          { manualRef: manualRef('§4.11 "Deluge Voices" (Setting the Synth Polyphony)', 105) })
       : null,
   ]);
 
@@ -1383,18 +1460,10 @@ function buildGuide(patch) {
   push('Oscillators', oscSteps);
 
   // --- Mixer / levels -----------------------------------------------
+  // Level and Pan moved up into "Getting started" (see the comment there) --
+  // they're physically adjacent to Synth mode/Master transpose on real
+  // hardware, in the same shortcut-grid column.
   const mixSteps = [];
-  // The voice's own overall output level -- distinct from (and set
-  // independently of) the OSC1/OSC2 balance below. Previously uncovered
-  // anywhere in this app (see INIT.volume's own comment for how that gap
-  // was found) despite having its own dedicated shortcut pad.
-  if (dp.volume && q31Differs(dp.volume, INIT.volume)) {
-    mixSteps.push(makeStep('Level',
-      `${ck('defaultParams.volume', `${shift('LEVEL')} set to ${val(dv(dp.volume))}`)}.`,
-      `${ck('defaultParams.volume', `Overall level: ${val(rawPct(dp.volume) + '%')}`)}.`,
-      [cf('defaultParams.volume', 'Level')],
-      { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Level)', 88), conceptKey: 'mixer.level' }));
-  }
   // Previously assumed OSC1 always stays at its own default ("near full")
   // whenever OSC2's level was the one that changed, and never checked
   // oscAVolume itself at all -- silently dropping OSC1's own level
@@ -1403,8 +1472,8 @@ function buildGuide(patch) {
   // turned down and OSC2 left at default). Now checks both independently
   // and only claims "stays near full" about whichever one truly didn't
   // change.
-  const oscAVolChanged = dp.oscAVolume && q31Differs(dp.oscAVolume, INIT.oscAVolume);
-  const oscBVolChanged = dp.oscBVolume && q31Differs(dp.oscBVolume, INIT.oscBVolume);
+  const oscAVolChanged = !isRingmod && dp.oscAVolume && q31Differs(dp.oscAVolume, INIT.oscAVolume);
+  const oscBVolChanged = !isRingmod && dp.oscBVolume && q31Differs(dp.oscBVolume, INIT.oscBVolume);
   if (oscAVolChanged || oscBVolChanged) {
     const beginnerParts = [
       oscAVolChanged && ck('defaultParams.oscAVolume', `${shift('OSC1 LEVEL')} to ${val(dv(dp.oscAVolume))}`),
@@ -1429,13 +1498,6 @@ function buildGuide(patch) {
       `${ck('defaultParams.noiseVolume', `Blend in noise at ${val(rawPct(dp.noiseVolume) + '%')}`)}.`,
       [cf('defaultParams.noiseVolume', 'Noise')],
       { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Noise Level)', 89), conceptKey: 'mixer.noise' }));
-  }
-  if (dp.pan && q31Differs(dp.pan, INIT.pan)) {
-    mixSteps.push(makeStep('Pan',
-      `${ck('defaultParams.pan', `${shift('PAN')} set to ${val(dvPan(dp.pan))} (range -25 left to +25 right)`)}.`,
-      `${ck('defaultParams.pan', `Pan: ${val(pctOfPan(dp.pan) + '%')}`)} (negative = left).`,
-      [cf('defaultParams.pan', 'Pan')],
-      { manualRef: manualRef('§4.8 "Sound Editor: Grid Shortcuts" (Pan)', 92), conceptKey: 'mixer.pan' }));
   }
   push('Mixer', mixSteps);
 
@@ -2165,6 +2227,11 @@ function cableDepthField(label, source, destination, depthSource, mode) {
 // - multisample zones (sampleRanges.sampleRange), same list-shape reason.
 function buildCheckSteps(patch) {
   const isFm = patch.mode === 'fm';
+  // See buildGuide()'s own isRingmod comment: OSC1/OSC2 LEVEL is hidden by
+  // firmware itself in Ring Mod mode, so it must not be a checkable field
+  // there either -- a value the user can never reach or verify on the
+  // device should never be able to turn a step red.
+  const isRingmod = patch.mode === 'ringmod';
   const steps = [
     // Previously had no check fields at all in either buildGuide()'s own
     // "Synth engine mode"/"Polyphony" steps or here -- a real gap found via
@@ -2206,11 +2273,11 @@ function buildCheckSteps(patch) {
       ] },
     { id: 'mixer', label: 'Mixer', fields: [
         field('Level', 'defaultParams.volume'),
-        field('OSC1 level', 'defaultParams.oscAVolume'),
-        field('OSC2 level', 'defaultParams.oscBVolume'),
+        !isRingmod && field('OSC1 level', 'defaultParams.oscAVolume'),
+        !isRingmod && field('OSC2 level', 'defaultParams.oscBVolume'),
         field('Noise level', 'defaultParams.noiseVolume'),
         field('Pan', 'defaultParams.pan'),
-      ] },
+      ].filter(Boolean) },
     { id: 'unison', label: 'Unison', fields: [
         intField('Voice count', 'unison.num'),
         // Detune/Spread only matter with 2+ voices actually stacked -- with
@@ -2572,6 +2639,7 @@ function buildSignalPathSvg(patch, idPrefix) {
   const dp = patch.defaultParams || {};
   const cables = cablesOf(patch);
   const isFm = patch.mode === 'fm';
+  const isRingmod = patch.mode === 'ringmod';
   const noiseOn = dp.noiseVolume && q31Differs(dp.noiseVolume, INIT.noiseVolume);
   const env1 = patch.envelope1 || get(dp, 'envelope1');
   const env1On = env1 && ['attack', 'decay', 'sustain', 'release'].some(f => env1[f] && q31Differs(env1[f], INIT.env1[f]));
@@ -2715,14 +2783,17 @@ function buildSignalPathSvg(patch, idPrefix) {
   }
 
   const portaOn = dp.portamento && q31Differs(dp.portamento, INIT.portamento);
-  const mixTipLines = [
+  // OSC1/OSC2 LEVEL is hidden by firmware itself in Ring Mod mode (see
+  // buildGuide()'s isRingmod comment) -- showing a level here would
+  // describe a control the user can't actually reach on the device.
+  const mixTipLines = isRingmod ? [] : [
     `OSC1 level: ${dp.oscAVolume ? dv(dp.oscAVolume) : 50}`,
     `OSC2 level: ${dp.oscBVolume ? dv(dp.oscBVolume) : 0}`,
   ];
   if (noiseOn) mixTipLines.push(`Noise level: ${dv(dp.noiseVolume)}`);
   mixTipLines.push(uniOn ? `Unison voices: ${uni.num}${uni.detune ? `, detune ${uni.detune}` : ''}${uni.spread && uni.spread !== '0' ? `, spread ${uni.spread}` : ''}` : 'No unison (1 voice)');
   if (portaOn) mixTipLines.push(`Portamento: ${dv(dp.portamento)}`);
-  const mixChanged = uniOn || portaOn || (dp.oscBVolume && q31Differs(dp.oscBVolume, INIT.oscBVolume)) || noiseOn;
+  const mixChanged = uniOn || portaOn || (!isRingmod && dp.oscBVolume && q31Differs(dp.oscBVolume, INIT.oscBVolume)) || noiseOn;
   const mixSublabelParts = [uniOn ? `×${uni.num} unison` : null, portaOn ? 'glide' : null].filter(Boolean);
   const mixer = place(sdBox(col(60), ROW_Y, 60, BH, 'MIX', mixSublabelParts.length ? mixSublabelParts.join(', ') : null, mixChanged ? 'changed' : '', mixTipLines.join('\n')));
   sources.forEach(s => link(s, mixer, false));
@@ -5089,15 +5160,15 @@ const CHECK_FIELD_RESET_HOW = {
   'osc1.type': { how: shift('OSC1 TYPE'), format: v => v.toUpperCase() },
   'osc1.transpose': { how: shift('OSC1 TRANSPOSE'), format: v => `${v} st` },
   'osc1.cents': { how: `${shift('OSC1 TRANSPOSE')} (fine-tune)`, format: v => `${v} cents` },
-  'osc1.retrigPhase': { how: shift('OSC1 RETRIG PHASE'), format: v => v === '-1' ? 'off' : v },
+  'osc1.retrigPhase': { how: shift('OSC1 RETRIG PHASE'), format: v => v === '-1' ? 'off' : `${retrigPhaseDegrees(v)}°` },
   'osc2.type': { how: shift('OSC2 TYPE'), format: v => v.toUpperCase() },
   'osc2.transpose': { how: shift('OSC2 TRANSPOSE'), format: v => `${v} st` },
   'osc2.cents': { how: `${shift('OSC2 TRANSPOSE')} (fine-tune)`, format: v => `${v} cents` },
-  'osc2.retrigPhase': { how: shift('OSC2 RETRIG PHASE'), format: v => v === '-1' ? 'off' : v },
+  'osc2.retrigPhase': { how: shift('OSC2 RETRIG PHASE'), format: v => v === '-1' ? 'off' : `${retrigPhaseDegrees(v)}°` },
   'modulator1.transpose': { how: shift('MOD1 TRANSPOSE'), format: v => `${v} st` },
   'modulator2.transpose': { how: shift('MOD2 TRANSPOSE'), format: v => `${v} st` },
-  'modulator1.retrigPhase': { how: shift('MOD1 RETRIG PHASE'), format: v => v === '-1' ? 'off' : v },
-  'modulator2.retrigPhase': { how: shift('MOD2 RETRIG PHASE'), format: v => v === '-1' ? 'off' : v },
+  'modulator1.retrigPhase': { how: shift('MOD1 RETRIG PHASE'), format: v => v === '-1' ? 'off' : `${retrigPhaseDegrees(v)}°` },
+  'modulator2.retrigPhase': { how: shift('MOD2 RETRIG PHASE'), format: v => v === '-1' ? 'off' : `${retrigPhaseDegrees(v)}°` },
   'defaultParams.modulator1Amount': { how: shift('MOD1 LEVEL') },
   'defaultParams.modulator2Amount': { how: shift('MOD2 LEVEL') },
   'defaultParams.carrier1Feedback': { how: shift('OSC1 FEEDBACK') },
